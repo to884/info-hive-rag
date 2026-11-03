@@ -1,0 +1,16 @@
+{
+  "name": "rag",
+  "version": "0.1.0",
+  "description": "RAG（検索拡張生成）を扱う info-hive の Claude Code プラグイン。現在は初期構成のみ。",
+  "author": {
+    "name": "to884"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/to884/info-hive-rag",
+  "repository": "https://github.com/to884/info-hive-rag",
+  "keywords": [
+    "rag",
+    "retrieval-augmented-generation",
+    "japanese"
+  ]
+}
