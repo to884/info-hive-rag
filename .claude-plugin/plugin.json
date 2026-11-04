@@ -1,7 +1,10 @@
 {
   "name": "rag",
-  "version": "0.1.0",
-  "description": "RAG（検索拡張生成）を扱う info-hive の Claude Code プラグイン。現在は初期構成のみ。",
+  "version": "0.2.0",
+  "description": "wiki@info-hive に依存し、RAG（検索拡張生成）を扱う info-hive の Claude Code プラグイン。現在は初期構成のみ。",
+  "dependencies": [
+    "wiki@info-hive"
+  ],
   "author": {
     "name": "to884"
   },
