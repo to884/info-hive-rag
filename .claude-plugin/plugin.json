@@ -1,7 +1,7 @@
 {
   "name": "rag",
-  "version": "0.2.0",
-  "description": "wiki@info-hive に依存し、RAG（検索拡張生成）を扱う info-hive の Claude Code プラグイン。現在は初期構成のみ。",
+  "version": "0.3.0",
+  "description": "wiki@info-hive に依存し、PDF の抽出・OCR・埋め込みを永続ジョブで進め、中断後の再開とローカル検索を提供する Claude Code プラグイン。",
   "dependencies": [
     "wiki@info-hive"
   ],
