@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "rag": {
+      "command": "uv",
+      "args": ["run", "--no-project", "--script", "${CLAUDE_PLUGIN_ROOT}/scripts/rag_server.py"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  }
+}
