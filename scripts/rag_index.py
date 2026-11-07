@@ -18,18 +18,33 @@ from rag_config import Config, write_json
 from rag_pdf import chunks_for, extract_pages
 
 
+def file_id(info: os.stat_result) -> tuple[str, str] | None:
+    """ファイルの識別子（st_dev と st_ino）を文字列で返す。Windows の st_ino は 64 ビットに収まらないことがある。
+    識別子を返さないファイルシステム（st_ino が 0）では None を返す。"""
+    return (str(info.st_dev), str(info.st_ino)) if info.st_ino else None
+
+
 def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino, first.st_size, first.st_mtime_ns) == (
         second.st_dev, second.st_ino, second.st_size, second.st_mtime_ns)
 
 
-def read_pdf(path: Path) -> tuple[bytes, os.stat_result]:
-    """確かめたファイルを 1 回だけ開いて読み、読んだバイト列が PDF であることを確かめる（ADR-0013）。"""
+def read_pdf(path: Path, expected: tuple | None = None) -> tuple[bytes, os.stat_result]:
+    """確かめたファイルを 1 回だけ開いて読み、読んだバイト列が PDF であることを確かめる（ADR-0013）。
+
+    expected は登録したときのファイルの (st_dev, st_ino, st_size, st_mtime_ns)。開いたファイルがこれと
+    違えば読まない。登録のあとで親のフォルダーが差し替えられても、別のファイルを読まないため。
+    """
     before = os.lstat(path)
     with open(path, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if not _same_file(before, opened):
             raise ValueError("確かめた PDF と開いたファイルが違います。もう一度取り込んでください。")
+        if expected is not None:
+            dev, ino, size, mtime_ns = expected
+            if (opened.st_size, opened.st_mtime_ns) != (size, mtime_ns) or (
+                    ino not in (None, "", "0", 0) and file_id(opened) != (str(dev), str(ino))):
+                raise ValueError("登録した PDF と開いたファイルが違います。新しいジョブで取り込んでください。")
         data = handle.read()
         after = os.fstat(handle.fileno())
     if not _same_file(opened, after) or len(data) != after.st_size:
@@ -114,7 +129,8 @@ class Engine:
                 pages INTEGER, chunks INTEGER, fingerprint TEXT NOT NULL, ingested_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS locations (
                 path TEXT PRIMARY KEY, doc_id TEXT NOT NULL, size INTEGER, mtime_ns INTEGER,
-                confirmed_at REAL NOT NULL);
+                confirmed_at REAL NOT NULL, dev TEXT, ino TEXT);
+            CREATE INDEX IF NOT EXISTS locations_file ON locations(dev, ino);
             CREATE TABLE IF NOT EXISTS citations (
                 doc_id TEXT, source_page TEXT, PRIMARY KEY(doc_id, source_page));
             CREATE TABLE IF NOT EXISTS jobs (
@@ -154,7 +170,10 @@ class Engine:
 
     @staticmethod
     def _location(connection, doc_id: str) -> str | None:
-        """文書の今の場所を返す。最後に確かめた順に見て、記録した大きさと更新時刻が今と合う場所を選ぶ。"""
+        """文書の今の場所を返す。最後に確かめた順に見て、記録した大きさと更新時刻が今と合う場所を選ぶ。
+
+        合う場所がなければ None を返す。中身が変わったかもしれない場所を、古い版の出典として返さない。
+        """
         rows = connection.execute("SELECT path,size,mtime_ns FROM locations WHERE doc_id=? ORDER BY confirmed_at DESC",
                                   (doc_id,)).fetchall()
         for row in rows:
@@ -164,7 +183,7 @@ class Engine:
                 continue
             if (current.st_size, current.st_mtime_ns) == (row["size"], row["mtime_ns"]):
                 return row["path"]
-        return rows[0]["path"] if rows else None
+        return None
 
     def _source_page(self, wiki: Path, source_page: str) -> str:
         return self.config.source_page(wiki, source_page)
@@ -219,7 +238,7 @@ class Engine:
         return affected
 
     def ingest_pdf(self, wiki_root: str, source: str, source_page: str, title: str = "", progress=None,
-                   before_publish=None) -> dict:
+                   before_publish=None, expected: tuple | None = None) -> dict:
         wiki = Path(wiki_root).expanduser().resolve()
         folder = self.config.workspace(str(wiki))
         path = self.config.pdf_path(source)
@@ -232,14 +251,19 @@ class Engine:
                 if progress:
                     progress("PDF の読み込み", 0, 1)
                 # 遅い原資料を一度だけ順次読み込み、ハッシュと PDFium で共用する。
-                data, stat_after = read_pdf(path)
+                data, stat_after = read_pdf(path, expected)
                 if progress:
                     progress("PDF の読み込み", 1, 1)
                 doc_id = hashlib.sha256(data).hexdigest()
                 generation = hashlib.sha256((doc_id + self.config.fingerprint).encode("ascii")).hexdigest()
-                previous_location = connection.execute("SELECT doc_id FROM locations WHERE path=?", (location,)).fetchone()
                 existing = connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-                old_id = previous_location[0] if previous_location and previous_location[0] != doc_id else None
+                # この場所と、同じファイルの別名（ハードリンクなど）の場所が前に指していた文書は、古い版になる。
+                same_file = file_id(stat_after)
+                previous = connection.execute(
+                    "SELECT path,doc_id FROM locations WHERE path=? OR (? IS NOT NULL AND dev=? AND ino=?)",
+                    (location, same_file and 1, *(same_file or (None, None)))).fetchall()
+                aliases = [row["path"] for row in previous if row["path"] != location]
+                old_ids = sorted({row["doc_id"] for row in previous if row["doc_id"] != doc_id})
                 if existing:
                     pages_count, chunks_count = existing["pages"], existing["chunks"]
                     markdown = folder / "extracted" / generation / "document.md"
@@ -291,30 +315,38 @@ class Engine:
                 if before_publish:
                     before_publish()
                 # 新しい索引が揃うまでは旧版を検索対象として残す。
-                reviews = self._mark_reviews(wiki, connection, old_id) if old_id else []
+                reviews = sorted({page for old_id in old_ids for page in self._mark_reviews(wiki, connection, old_id)})
                 connection.execute("""INSERT OR REPLACE INTO documents
                     (doc_id,generation,title,pages,chunks,fingerprint,ingested_at)
                     VALUES (?,?,?,?,?,?,?)""",
                                    (doc_id, generation, existing["title"] if existing else title,
                                     pages_count, chunks_count, self.config.fingerprint, time.time()))
-                connection.execute("INSERT OR REPLACE INTO locations VALUES (?,?,?,?,?)",
-                                   (location, doc_id, stat_after.st_size, stat_after.st_mtime_ns, time.time()))
+                now = time.time()
+                for place in [location, *aliases]:
+                    connection.execute("INSERT OR REPLACE INTO locations VALUES (?,?,?,?,?,?,?)",
+                                       (place, doc_id, stat_after.st_size, stat_after.st_mtime_ns,
+                                        now if place == location else now - 1e-6, *(same_file or (None, None))))
                 connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, source_page))
                 # 改名した同じ内容の資料は、存在しなくなった旧パスだけを台帳から外す。
                 for row in connection.execute("SELECT path FROM locations WHERE doc_id=?", (doc_id,)).fetchall():
                     if not os.path.exists(row["path"]):
                         connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
                 connection.execute("UPDATE jobs SET status='complete', error=NULL WHERE generation=?", (generation,))
-                if old_id and not connection.execute("SELECT 1 FROM locations WHERE doc_id=?", (old_id,)).fetchone():
-                    connection.execute("DELETE FROM documents WHERE doc_id=?", (old_id,))
+                removed = []
+                for old_id in old_ids:
+                    if not connection.execute("SELECT 1 FROM locations WHERE doc_id=?", (old_id,)).fetchone():
+                        connection.execute("DELETE FROM documents WHERE doc_id=?", (old_id,))
+                        # 内部の途中経過も消す。同じ内容に戻したとき、埋め込みを最初からやり直すため。
+                        old_generation = hashlib.sha256((old_id + self.config.fingerprint).encode("ascii")).hexdigest()
+                        connection.execute("DELETE FROM jobs WHERE generation=?", (old_generation,))
+                        removed.append((old_id, old_generation))
                 connection.commit()
                 # コミット後の保守が失敗しても、新版は検索できる。旧行は active generation の条件で除外する。
                 cleanup_error = None
-                if old_id and not connection.execute("SELECT 1 FROM documents WHERE doc_id=?", (old_id,)).fetchone():
+                for old_id, old_generation in removed:
                     try:
                         self._table(folder).delete(f"doc_id = '{old_id}'")
                         self._maintain_indexes(folder,self._table(folder))
-                        old_generation = hashlib.sha256((old_id + self.config.fingerprint).encode("ascii")).hexdigest()
                         old_cache = folder / "extracted" / old_generation
                         for cached in old_cache.glob("*.json"):
                             cached.unlink()

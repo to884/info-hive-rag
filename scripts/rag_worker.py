@@ -154,7 +154,8 @@ def run(data_dir: str):
                     raise ValueError("登録後に PDF が変わりました。新しいジョブで取り込んでください。")
                 result = get_engine(job["config"]).ingest_pdf(job["wiki"], job["source"], job["source_page"], job["title"],
                     progress=lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total),
-                    before_publish=lambda: jobs.begin_publication(job["id"], owner))
+                    before_publish=lambda: jobs.begin_publication(job["id"], owner),
+                    expected=(job["dev"], job["ino"], job["size"], job["mtime_ns"]))
                 jobs.finish(job["id"], owner, result=result)
             except JobCancelled:
                 pass

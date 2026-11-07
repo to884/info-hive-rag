@@ -33,7 +33,8 @@ class Jobs:
                     phase TEXT NOT NULL DEFAULT '受付', completed INTEGER NOT NULL DEFAULT 0,
                     total INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
                     owner TEXT, error TEXT, result TEXT, created_at REAL, updated_at REAL,
-                    publication_started INTEGER NOT NULL DEFAULT 0, request_key TEXT NOT NULL);
+                    publication_started INTEGER NOT NULL DEFAULT 0, request_key TEXT NOT NULL,
+                    dev TEXT, ino TEXT);
                 CREATE INDEX IF NOT EXISTS ingest_jobs_request ON ingest_jobs(request_key, status);
                 CREATE TABLE IF NOT EXISTS search_requests (
                     id TEXT PRIMARY KEY, config TEXT NOT NULL, wiki TEXT NOT NULL,
@@ -72,10 +73,10 @@ class Jobs:
             else:
                 identity = uuid.uuid4().hex
                 db.execute("""INSERT INTO ingest_jobs
-                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,dev,ino)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (identity, str(wiki), str(path), page, title.strip(), stat.st_size, stat.st_mtime_ns,
-                     json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key))
+                     json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
     def status(self, wiki_root: str, job_id: str) -> dict:
@@ -88,6 +89,8 @@ class Jobs:
         result.pop("config")
         result.pop("owner")
         result.pop("request_key")
+        result.pop("dev")
+        result.pop("ino")
         result["job_id"] = result.pop("id")
         result["result"] = json.loads(result["result"]) if result["result"] else None
         return result
@@ -105,7 +108,8 @@ class Jobs:
 
     def unfinished(self) -> bool:
         with self.connect() as db:
-            ingest = db.execute("SELECT 1 FROM ingest_jobs WHERE status NOT IN ('completed','cancelled') LIMIT 1").fetchone()
+            # 失敗したジョブは明示的な再試行でしか動かないので、設定の変更を塞がない（ADR-0013）。
+            ingest = db.execute("SELECT 1 FROM ingest_jobs WHERE status IN ('queued','running','paused') LIMIT 1").fetchone()
             search = db.execute("SELECT 1 FROM search_requests WHERE status IN ('queued','running') AND updated_at>? LIMIT 1", (time.time() - 5,)).fetchone()
             return bool(ingest or search)
 

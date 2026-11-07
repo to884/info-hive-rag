@@ -43,6 +43,14 @@ def config_path() -> Path:
     return Path(os.environ.get("INFO_HIVE_RAG_CONFIG", app_data() / "config.json")).expanduser().resolve()
 
 
+def _network_drive(path: Path) -> bool:
+    """Windows で、パスのドライブ文字が、利用者が割り当てたネットワークドライブなら True を返す。"""
+    if not path.drive or not path.drive.endswith(":"):
+        return False
+    import ctypes
+    return ctypes.windll.kernel32.GetDriveTypeW(path.drive + "\\") == 4  # DRIVE_REMOTE
+
+
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
@@ -145,6 +153,9 @@ class Config:
             raise ValueError("PDF が見つかりません。絶対パスを確かめてください。") from None
         if not stat.S_ISREG(info.st_mode) or resolved.suffix.lower() != ".pdf":
             raise ValueError("読み取れる PDF ファイル（拡張子 .pdf）を指定してください。")
+        if sys.platform == "win32" and str(resolved).startswith("\\\\") and not _network_drive(path):
+            # ローカルのフォルダーに置かれたリンクが、ネットワーク上のファイルを指している。
+            raise ValueError("ローカルのフォルダーから、ネットワーク上のファイルへのリンクはたどりません。")
         for folder in (self.data_dir, self.model_cache_dir, self.uv_cache_dir):
             if resolved == folder or resolved.is_relative_to(folder):
                 raise ValueError("rag の派生データやキャッシュの中の PDF は登録できません。")
