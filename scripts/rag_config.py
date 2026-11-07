@@ -43,6 +43,13 @@ def config_path() -> Path:
     return Path(os.environ.get("INFO_HIVE_RAG_CONFIG", app_data() / "config.json")).expanduser().resolve()
 
 
+def _has_control(text: str) -> bool:
+    """C0 と C1 の制御文字（改行、タブ、U+0085 など）を含むなら True を返す。frontmatter に書くと、
+    wiki の手書きのパーサーと PyYAML で値が食い違う。"""
+    import unicodedata
+    return any(unicodedata.category(character) == "Cc" for character in text)
+
+
 def _network_drive(path: Path) -> bool:
     """Windows で、パスのドライブ文字が、利用者が割り当てたネットワークドライブなら True を返す。"""
     if not path.drive or not path.drive.endswith(":"):
@@ -146,7 +153,7 @@ class Config:
         text = str(source).strip()
         if not text:
             raise ValueError("PDF の絶対パスを指定してください。")
-        if any(ord(character) < 0x20 or character == "\x7f" for character in text):
+        if _has_control(text):
             raise ValueError("改行などの制御文字を含むパスは指定できません。")
         # UNC とデバイスのパスは、解決する前に拒む。知らないサーバーに接続させないため。
         # Windows では /\server/... のように区切りを混ぜても UNC になるので、組み立てたパスのドライブでも見る。
@@ -163,6 +170,8 @@ class Config:
             info = os.lstat(resolved)
         except OSError:
             raise ValueError("PDF が見つかりません。絶対パスを確かめてください。") from None
+        if _has_control(str(resolved)):
+            raise ValueError("解決したパスが、改行などの制御文字を含みます。")
         if not stat.S_ISREG(info.st_mode) or resolved.suffix.lower() != ".pdf":
             raise ValueError("読み取れる PDF ファイル（拡張子 .pdf）を指定してください。")
         if sys.platform == "win32" and str(resolved).startswith("\\\\") and not _network_drive(path):

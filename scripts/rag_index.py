@@ -257,26 +257,6 @@ class Engine:
                 doc_id = hashlib.sha256(data).hexdigest()
                 generation = hashlib.sha256((doc_id + self.config.fingerprint).encode("ascii")).hexdigest()
                 existing = connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-                # この場所と、同じファイルの別名（ハードリンクなど）の場所が前に指していた文書は、古い版になる。
-                same_file = file_id(stat_after)
-                previous = connection.execute(
-                    "SELECT path,doc_id FROM locations WHERE path=? OR (? IS NOT NULL AND dev=? AND ino=?)",
-                    (location, same_file and 1, *(same_file or (None, None)))).fetchall()
-                aliases, affected = [], []
-                for row in previous:
-                    if row["path"] == location:
-                        affected.append(row)
-                        continue
-                    # 記録した識別子だけでは決めない。今も同じファイルを指しているときだけ別名とみなす。
-                    try:
-                        current = os.stat(row["path"])
-                    except OSError:
-                        continue
-                    if file_id(current) == same_file and (current.st_size, current.st_mtime_ns) == (
-                            stat_after.st_size, stat_after.st_mtime_ns):
-                        aliases.append(row["path"])
-                        affected.append(row)
-                old_ids = sorted({row["doc_id"] for row in affected if row["doc_id"] != doc_id})
                 if existing:
                     pages_count, chunks_count = existing["pages"], existing["chunks"]
                     markdown = folder / "extracted" / generation / "document.md"
@@ -327,6 +307,32 @@ class Engine:
                     raise ValueError("処理中に PDF が変更されました。新しいジョブで取り込んでください。")
                 if before_publish:
                     before_publish()
+                # この場所と、同じファイルの別名（ハードリンクなど）の場所が前に指していた文書は、古い版になる。
+                # 別名は公開の直前に調べる。取り込みの途中で別名が差し替えられても、残っている古い版を消さないため。
+                same_file = file_id(stat_after)
+                previous = connection.execute(
+                    "SELECT path,doc_id FROM locations WHERE path=? OR (? IS NOT NULL AND dev=? AND ino=?)",
+                    (location, same_file and 1, *(same_file or (None, None)))).fetchall()
+                aliases, affected, vanished = [], [], []
+                for row in previous:
+                    if row["path"] == location:
+                        affected.append(row)
+                        continue
+                    # 記録した識別子だけでは決めない。今も同じファイルを指しているときだけ別名とみなす。
+                    try:
+                        current = os.stat(row["path"])
+                    except FileNotFoundError:
+                        vanished.append(row)  # もうない別名の行は外す
+                        continue
+                    except OSError:
+                        continue
+                    if file_id(current) == same_file and (current.st_size, current.st_mtime_ns) == (
+                            stat_after.st_size, stat_after.st_mtime_ns):
+                        aliases.append(row["path"])
+                        affected.append(row)
+                old_ids = sorted({row["doc_id"] for row in affected + vanished if row["doc_id"] != doc_id})
+                for row in vanished:
+                    connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
                 # 新しい索引が揃うまでは旧版を検索対象として残す。
                 reviews = sorted({page for old_id in old_ids for page in self._mark_reviews(wiki, connection, old_id)})
                 connection.execute("""INSERT OR REPLACE INTO documents
