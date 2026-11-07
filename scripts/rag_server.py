@@ -78,15 +78,17 @@ def engine() -> Engine:
 
 
 @server.tool()
-def configure(reference_roots: dict[str, str], data_dir: str = "", embedding_model: str = "", retrieval: dict | None = None) -> dict:
-    """PDF の参照ルートと派生データの保存先を、この PC の設定に保存する。"""
+def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | None = None) -> dict:
+    """派生データの保存先、埋め込みのモデル、検索の設定を、この PC の設定に保存する。PDF は登録のときに絶対パスで渡す。"""
     global _engine, _jobs, _host, _config
     with _lock:
         if jobs().unfinished():
             raise ValueError("未完了ジョブがあります。完了させるかキャンセルしてから設定を変更してください。")
         current = configuration()
         embedding_model = embedding_model or current.model
-        values = {**current.values, "reference_roots": reference_roots, "embedding_model": embedding_model}
+        # 0.3.0 の reference_roots は使わないので、保存し直すときに消す（ADR-0013）。
+        values = {key: value for key, value in current.values.items() if key != "reference_roots"}
+        values["embedding_model"] = embedding_model
         if embedding_model != current.model:
             values.pop("embedding_revision", None)
         if data_dir:
@@ -97,9 +99,6 @@ def configure(reference_roots: dict[str, str], data_dir: str = "", embedding_mod
                 raise ValueError("retrieval に未対応の設定名があります。")
             values.update(retrieval)
         checked = Config(values)
-        for root in checked.roots.values():
-            if not root.is_dir():
-                raise ValueError("参照ルートのフォルダが見つかりません。")
         if _host:
             _host.close()
         write_json(config_path(), values)
@@ -107,12 +106,12 @@ def configure(reference_roots: dict[str, str], data_dir: str = "", embedding_mod
         _engine, _jobs = None, Jobs(checked.data_dir)
         _host = WorkerHost(_jobs)
         _host.start()
-        return {"config": str(config_path()), "data_dir": str(checked.data_dir), "reference_roots": list(checked.roots)}
+        return {"config": str(config_path()), "data_dir": str(checked.data_dir), "embedding_model": checked.model}
 
 
 @server.tool()
 def register_pdf(wiki_root: str, source: str, source_page: str, title: str = "") -> dict:
-    """wiki の PDF 取り込みを受け付け、永続ジョブを返す。queued は索引化完了ではない。原本はコピーしない。"""
+    """wiki の PDF 取り込みを受け付け、永続ジョブを返す。source は利用者が指定した PDF の絶対パス。queued は索引化完了ではない。原本はコピーしない。"""
     with _lock:
         return jobs().register(configuration(), wiki_root, source, source_page, title)
 
@@ -172,6 +171,10 @@ def status(wiki_root: str) -> dict:
     result = engine().status(wiki_root)
     result["index_jobs"] = result.pop("jobs")
     result["jobs"] = jobs().list(wiki_root)
+    legacy = jobs().legacy_data()
+    if legacy:
+        result["legacy_data"] = {"paths": legacy,
+                                 "message": "rag 0.3.0 のデータが残っています。新しい版は読まないので、消してかまいません。"}
     return result
 
 

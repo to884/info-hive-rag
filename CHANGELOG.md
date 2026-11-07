@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
+### 変更
+
+- 参照ルートを廃止しました（ADR-0013）。`/rag:setup` で PDF のフォルダを登録する必要はなくなり、`register_pdf` と `ingest_pdf` には PDF の絶対パスを渡します。`configure` の引数 `reference_roots` もなくしました。相対パスと「名前:相対パス」は受け付けません。
+- 取り込みと検索の結果の `raw` を、`/` 区切りの絶対パスにしました。PDF の内容の SHA-256 を `sha256` として返します。
+- 受け付けるのは、拡張子が `.pdf` の通常のファイルで、派生データとキャッシュの外にあるものです。UNC パスとデバイスのパスは拒みます。読み込むときは、確かめたファイルを 1 回だけ開き、読んだバイト列の先頭が `%PDF-` であることを確かめます。
+- 0.3.0 の設定、ジョブ、台帳との互換をなくしました。ジョブは `jobs-v2.sqlite` に、台帳と索引は `wikis-v2/` に置き、0.3.0 の `jobs.sqlite` と `wikis/` は開きません。残っていれば `status` が `legacy_data` で伝えます。0.3.0 で取り込んだ PDF は、取り込み直してください。
+
+### 修正
+
+- 大きさと更新時刻を変えずに中身を差し替えた PDF を登録し直すと、前の完了したジョブが返り、取り込み直せませんでした。完了、失敗、キャンセルのジョブしかなければ、新しいジョブを作ります。
+- 同じ内容の PDF を 2 か所で登録したあと片方だけを書き換えると、古い版の検索結果の出典が、書き換えたほうの場所を指していました。文書に代表の場所を持たず、大きさと更新時刻が今と合う場所を返します。
+
 ## [0.3.0] - 2026-11-05
 
 ### 変更
@@ -43,7 +57,8 @@
 
 - プラグイン `rag` の初期構成を追加しました。
 
-[Unreleased]: https://github.com/to884/info-hive-rag/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/to884/info-hive-rag/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/to884/info-hive-rag/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/to884/info-hive-rag/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/to884/info-hive-rag/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/to884/info-hive-rag/releases/tag/v0.1.0
