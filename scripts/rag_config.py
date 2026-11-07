@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import sys
 import time
 import uuid
@@ -42,6 +43,21 @@ def config_path() -> Path:
     return Path(os.environ.get("INFO_HIVE_RAG_CONFIG", app_data() / "config.json")).expanduser().resolve()
 
 
+def _has_control(text: str) -> bool:
+    """C0 と C1 の制御文字（改行、タブ、U+0085 など）を含むなら True を返す。frontmatter に書くと、
+    wiki の手書きのパーサーと PyYAML で値が食い違う。"""
+    import unicodedata
+    return any(unicodedata.category(character) == "Cc" for character in text)
+
+
+def _network_drive(path: Path) -> bool:
+    """Windows で、パスのドライブ文字が、利用者が割り当てたネットワークドライブなら True を返す。"""
+    if not path.drive or not path.drive.endswith(":"):
+        return False
+    import ctypes
+    return ctypes.windll.kernel32.GetDriveTypeW(path.drive + "\\") == 4  # DRIVE_REMOTE
+
+
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
@@ -64,7 +80,6 @@ class Config:
             values = json.loads(self.path.read_text(encoding="utf-8-sig")) if self.path.exists() else {}
         self.values = values
         self.data_dir = Path(values.get("data_dir", app_data() / "data")).expanduser().resolve()
-        self.roots = {name: Path(path).expanduser().resolve() for name, path in values.get("reference_roots", {}).items()}
         self.model = values.get("embedding_model", DEFAULT_MODEL)
         if self.model not in MODELS:
             raise ValueError("embedding_model は Ruri v3 の 30m、70m、130m、310m から選んでください。")
@@ -101,15 +116,10 @@ class Config:
             raise ValueError("search_nprobes は 1〜4096、search_refine_factor は 1〜100 にしてください。")
         if not 1<=self.ann_min_rows<=1000000 or not math.isfinite(self.ann_rebuild_growth) or not 2<=self.ann_rebuild_growth<=16 or not 1<=self.index_cleanup_age_days<=36500:
             raise ValueError('ann_min_rows は1〜1000000、ann_rebuild_growth は2〜16、index_cleanup_age_days は1〜36500にしてください。')
-        for name, root in self.roots.items():
-            if not name or any(c in name for c in ":/\\"):
-                raise ValueError("参照ルート名にコロンやパスの区切りは使えません。")
-            if any(path == root or path.is_relative_to(root) for path in (self.data_dir, self.model_cache_dir, self.uv_cache_dir)):
-                raise ValueError("派生データとキャッシュは参照ルートの外にしてください。原資料の場所には書き込みません。")
 
     def snapshot(self) -> dict:
-        return {**self.values, "data_dir": str(self.data_dir),
-                "reference_roots": {name: str(path) for name, path in self.roots.items()},
+        values = {key: value for key, value in self.values.items() if key != "reference_roots"}
+        return {**values, "data_dir": str(self.data_dir),
                 "embedding_model": self.model, "embedding_revision": self.revision,
                 "model_cache_dir": str(self.model_cache_dir), "uv_cache_dir": str(self.uv_cache_dir)}
 
@@ -121,29 +131,53 @@ class Config:
 
     @property
     def fingerprint(self) -> str:
-        policy = ["rag-v1", self.model, self.revision, self.dimension, self.chunk_chars,
+        policy = ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
                   self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
         return hashlib.sha256(json.dumps(policy).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def pdf_source(source: str) -> str:
+        """ジョブに記録する、利用者が渡したままの絶対パス。ネットワークドライブの PDF は解決すると UNC に
+        なるので、解決したパスではなくこちらを記録し、ワーカーで同じように確かめ直す。"""
+        return str(Path(str(source).strip()).expanduser())
 
     def workspace(self, wiki_root: str) -> Path:
         wiki = Path(wiki_root).expanduser().resolve()
         if not (wiki / "SCHEMA.md").is_file():
             raise ValueError("wiki_root に SCHEMA.md がありません。先に wiki を初期化してください。")
         identity = hashlib.sha256(os.path.normcase(str(wiki)).encode("utf-8")).hexdigest()[:24]
-        return self.data_dir / "wikis" / identity
+        return self.data_dir / "wikis-v2" / identity
 
-    def reference(self, source: str) -> tuple[str, str, Path]:
-        # 名前付き参照と絶対パスの両方を受け付ける。解決後にもルート外への逸脱を調べる。
-        name, separator, relative = source.partition(":")
-        if separator and name in self.roots:
-            root = self.roots[name]
-            path = (root / relative).resolve()
-            if not path.is_relative_to(root):
-                raise ValueError("参照ルートの外の PDF は指定できません。")
-            return name, path.relative_to(root).as_posix(), path
-        path = Path(source).expanduser().resolve()
-        matches = [(name, root) for name, root in self.roots.items() if path.is_relative_to(root)]
-        if not matches:
-            raise ValueError("PDF が参照ルートにありません。configure でそのフォルダを登録してください。")
-        name, root = max(matches, key=lambda item: len(item[1].parts))
-        return name, path.relative_to(root).as_posix(), path
+    def pdf_path(self, source: str) -> Path:
+        """登録する PDF の絶対パスを確かめ、解決したパスを返す。中身は読まない（ADR-0013）。"""
+        text = str(source).strip()
+        if not text:
+            raise ValueError("PDF の絶対パスを指定してください。")
+        if _has_control(text):
+            raise ValueError("改行などの制御文字を含むパスは指定できません。")
+        # UNC とデバイスのパスは、解決する前に拒む。知らないサーバーに接続させないため。
+        # Windows では /\server/... のように区切りを混ぜても UNC になるので、組み立てたパスのドライブでも見る。
+        unc = ValueError("UNC パスとデバイスのパスは指定できません。ネットワークの PDF は、ドライブ文字を割り当ててから指定してください。")
+        if text.startswith("\\\\") or (sys.platform == "win32" and text[:2] in ("//", "/\\", "\\/")):
+            raise unc
+        path = Path(text).expanduser()
+        if path.drive.startswith(("\\\\", "//")) or str(path).startswith("\\\\"):
+            raise unc
+        if not path.is_absolute():
+            raise ValueError("PDF は絶対パスで指定してください。")
+        try:
+            resolved = path.resolve(strict=True)
+            info = os.lstat(resolved)
+        except OSError:
+            raise ValueError("PDF が見つかりません。絶対パスを確かめてください。") from None
+        if _has_control(str(resolved)):
+            raise ValueError("解決したパスが、改行などの制御文字を含みます。")
+        if not stat.S_ISREG(info.st_mode) or resolved.suffix.lower() != ".pdf":
+            raise ValueError("読み取れる PDF ファイル（拡張子 .pdf）を指定してください。")
+        if sys.platform == "win32" and str(resolved).startswith("\\\\") and not _network_drive(path):
+            # ローカルのフォルダーに置かれたリンクが、ネットワーク上のファイルを指している。
+            raise ValueError("ローカルのフォルダーから、ネットワーク上のファイルへのリンクはたどりません。")
+        for folder in (self.data_dir, self.model_cache_dir, self.uv_cache_dir):
+            if resolved == folder or resolved.is_relative_to(folder):
+                raise ValueError("rag の派生データやキャッシュの中の PDF は登録できません。")
+        return resolved

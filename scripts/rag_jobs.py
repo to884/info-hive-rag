@@ -21,7 +21,8 @@ class Jobs:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.data_dir / "jobs.sqlite"
+        # 0.3.0 の jobs.sqlite は開かない（ADR-0013）。
+        self.path = self.data_dir / "jobs-v2.sqlite"
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -31,18 +32,16 @@ class Jobs:
                     config TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
                     phase TEXT NOT NULL DEFAULT '受付', completed INTEGER NOT NULL DEFAULT 0,
                     total INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
-                    owner TEXT, error TEXT, result TEXT, created_at REAL, updated_at REAL);
+                    owner TEXT, error TEXT, result TEXT, created_at REAL, updated_at REAL,
+                    publication_started INTEGER NOT NULL DEFAULT 0, request_key TEXT NOT NULL,
+                    dev TEXT, ino TEXT);
+                CREATE INDEX IF NOT EXISTS ingest_jobs_request ON ingest_jobs(request_key, status);
                 CREATE TABLE IF NOT EXISTS search_requests (
                     id TEXT PRIMARY KEY, config TEXT NOT NULL, wiki TEXT NOT NULL,
                     query TEXT NOT NULL, result_limit INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'queued', result TEXT, error TEXT,
                     updated_at REAL NOT NULL);
             """)
-            db.execute('BEGIN IMMEDIATE')
-            columns={row['name'] for row in db.execute('PRAGMA table_info(ingest_jobs)')}
-            if 'publication_started' not in columns:
-                db.execute('ALTER TABLE ingest_jobs ADD COLUMN publication_started INTEGER NOT NULL DEFAULT 0')
-                db.execute("UPDATE ingest_jobs SET publication_started=1 WHERE phase='索引の公開' OR status='completed'")
 
     @contextmanager
     def connect(self):
@@ -56,21 +55,28 @@ class Jobs:
     def register(self, config: Config, wiki_root: str, source: str, source_page: str, title: str = "") -> dict:
         wiki = Path(wiki_root).expanduser().resolve()
         config.workspace(str(wiki))
-        root, relative, path = config.reference(source)
-        if path.suffix.lower() != ".pdf" or not path.is_file():
-            raise ValueError("読み取れる PDF ファイルを指定してください。")
+        path = config.pdf_path(source)
         page = config.source_page(wiki, source_page)
-        stat = path.stat()
-        key = [os.path.normcase(str(wiki)), root, relative, stat.st_size, stat.st_mtime_ns,
+        stat = os.stat(path)
+        key = [os.path.normcase(str(wiki)), str(path), stat.st_size, stat.st_mtime_ns,
                config.fingerprint, page, title.strip()]
-        identity = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode("utf-8")).hexdigest()
+        request_key = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode("utf-8")).hexdigest()
         now = time.time()
         with self.connect() as db:
-            db.execute("""INSERT OR IGNORE INTO ingest_jobs
-                (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (identity, str(wiki), str(path), page, title.strip(), stat.st_size, stat.st_mtime_ns,
-                 json.dumps(config.snapshot(), ensure_ascii=False), now, now))
+            db.execute("BEGIN IMMEDIATE")
+            # 同じ登録が受け付け済みか処理中なら、そのジョブを返す。完了、失敗、キャンセルしかなければ
+            # 新しいジョブにする。大きさと更新時刻を変えずに中身を差し替えた PDF も読み直すため（ADR-0013）。
+            row = db.execute("""SELECT id FROM ingest_jobs WHERE request_key=?
+                AND status IN ('queued','running','paused') ORDER BY created_at DESC LIMIT 1""", (request_key,)).fetchone()
+            if row:
+                identity = row[0]
+            else:
+                identity = uuid.uuid4().hex
+                db.execute("""INSERT INTO ingest_jobs
+                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,dev,ino)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (identity, str(wiki), config.pdf_source(source), page, title.strip(), stat.st_size, stat.st_mtime_ns,
+                     json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
     def status(self, wiki_root: str, job_id: str) -> dict:
@@ -82,6 +88,9 @@ class Jobs:
         result = dict(row)
         result.pop("config")
         result.pop("owner")
+        result.pop("request_key")
+        result.pop("dev")
+        result.pop("ino")
         result["job_id"] = result.pop("id")
         result["result"] = json.loads(result["result"]) if result["result"] else None
         return result
@@ -92,9 +101,15 @@ class Jobs:
             ids = [row[0] for row in db.execute("SELECT id FROM ingest_jobs WHERE wiki=? ORDER BY created_at DESC", (wiki,))]
         return [self.status(wiki, identity) for identity in ids]
 
+    def legacy_data(self) -> list[str]:
+        """0.3.0 が残したデータの場所を返す。新しい版は開かず、消してよい（ADR-0013）。"""
+        names = ("jobs.sqlite", "jobs.sqlite-wal", "jobs.sqlite-shm", "wikis")
+        return [str(self.data_dir / name) for name in names if (self.data_dir / name).exists()]
+
     def unfinished(self) -> bool:
         with self.connect() as db:
-            ingest = db.execute("SELECT 1 FROM ingest_jobs WHERE status NOT IN ('completed','cancelled') LIMIT 1").fetchone()
+            # 失敗したジョブは明示的な再試行でしか動かないので、設定の変更を塞がない（ADR-0013）。
+            ingest = db.execute("SELECT 1 FROM ingest_jobs WHERE status IN ('queued','running','paused') LIMIT 1").fetchone()
             search = db.execute("SELECT 1 FROM search_requests WHERE status IN ('queued','running') AND updated_at>? LIMIT 1", (time.time() - 5,)).fetchone()
             return bool(ingest or search)
 
