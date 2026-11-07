@@ -25,8 +25,6 @@ Claude Code で、マーケットプレイスを追加してから `rag` を入�
 /plugin install rag@info-hive
 ```
 
-リポジトリは非公開のため、GitHub の認証情報が必要です。
-
 ## PDF の取り込み
 
 1. `/rag:setup` で PDF のあるフォルダを参照ルートとして登録します。派生データは原本と別の場所に保存します。
