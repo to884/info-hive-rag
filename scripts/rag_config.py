@@ -128,6 +128,12 @@ class Config:
                   self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
         return hashlib.sha256(json.dumps(policy).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def pdf_source(source: str) -> str:
+        """ジョブに記録する、利用者が渡したままの絶対パス。ネットワークドライブの PDF は解決すると UNC に
+        なるので、解決したパスではなくこちらを記録し、ワーカーで同じように確かめ直す。"""
+        return str(Path(str(source).strip()).expanduser())
+
     def workspace(self, wiki_root: str) -> Path:
         wiki = Path(wiki_root).expanduser().resolve()
         if not (wiki / "SCHEMA.md").is_file():
@@ -140,10 +146,16 @@ class Config:
         text = str(source).strip()
         if not text:
             raise ValueError("PDF の絶対パスを指定してください。")
+        if any(ord(character) < 0x20 or character == "\x7f" for character in text):
+            raise ValueError("改行などの制御文字を含むパスは指定できません。")
         # UNC とデバイスのパスは、解決する前に拒む。知らないサーバーに接続させないため。
-        if text.startswith("\\\\") or (sys.platform == "win32" and text.startswith("//")):
-            raise ValueError("UNC パスとデバイスのパスは指定できません。ネットワークの PDF は、ドライブ文字を割り当ててから指定してください。")
+        # Windows では /\server/... のように区切りを混ぜても UNC になるので、組み立てたパスのドライブでも見る。
+        unc = ValueError("UNC パスとデバイスのパスは指定できません。ネットワークの PDF は、ドライブ文字を割り当ててから指定してください。")
+        if text.startswith("\\\\") or (sys.platform == "win32" and text[:2] in ("//", "/\\", "\\/")):
+            raise unc
         path = Path(text).expanduser()
+        if path.drive.startswith(("\\\\", "//")) or str(path).startswith("\\\\"):
+            raise unc
         if not path.is_absolute():
             raise ValueError("PDF は絶対パスで指定してください。")
         try:

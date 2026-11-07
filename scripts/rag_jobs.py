@@ -75,7 +75,7 @@ class Jobs:
                 db.execute("""INSERT INTO ingest_jobs
                     (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,dev,ino)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (identity, str(wiki), str(path), page, title.strip(), stat.st_size, stat.st_mtime_ns,
+                    (identity, str(wiki), config.pdf_source(source), page, title.strip(), stat.st_size, stat.st_mtime_ns,
                      json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 

@@ -262,8 +262,21 @@ class Engine:
                 previous = connection.execute(
                     "SELECT path,doc_id FROM locations WHERE path=? OR (? IS NOT NULL AND dev=? AND ino=?)",
                     (location, same_file and 1, *(same_file or (None, None)))).fetchall()
-                aliases = [row["path"] for row in previous if row["path"] != location]
-                old_ids = sorted({row["doc_id"] for row in previous if row["doc_id"] != doc_id})
+                aliases, affected = [], []
+                for row in previous:
+                    if row["path"] == location:
+                        affected.append(row)
+                        continue
+                    # 記録した識別子だけでは決めない。今も同じファイルを指しているときだけ別名とみなす。
+                    try:
+                        current = os.stat(row["path"])
+                    except OSError:
+                        continue
+                    if file_id(current) == same_file and (current.st_size, current.st_mtime_ns) == (
+                            stat_after.st_size, stat_after.st_mtime_ns):
+                        aliases.append(row["path"])
+                        affected.append(row)
+                old_ids = sorted({row["doc_id"] for row in affected if row["doc_id"] != doc_id})
                 if existing:
                     pages_count, chunks_count = existing["pages"], existing["chunks"]
                     markdown = folder / "extracted" / generation / "document.md"
