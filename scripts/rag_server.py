@@ -78,8 +78,11 @@ def engine() -> Engine:
 
 
 @server.tool()
-def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | None = None) -> dict:
-    """派生データの保存先、埋め込みのモデル、検索の設定を、この PC の設定に保存する。PDF は登録のときに絶対パスで渡す。"""
+def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | None = None,
+              ocr_mode: str | None = None, ocr_dpi: int | None = None) -> dict:
+    """派生データの保存先、埋め込みのモデル、検索の設定、OCR の設定（ocr_mode は auto / always / off、ocr_dpi は 72〜300）を、
+    この PC の設定に保存する。指定しない項目は今の設定のまま。PDF は登録のときに絶対パスで渡す。
+    reingest_required が true なら取り込み済みの PDF の入れ直しが要り、extraction_changed が true なら入れ直しで OCR もやり直す。"""
     global _engine, _jobs, _host, _config
     with _lock:
         if jobs().unfinished():
@@ -98,6 +101,10 @@ def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | N
             if set(retrieval) - allowed:
                 raise ValueError("retrieval に未対応の設定名があります。")
             values.update(retrieval)
+        if ocr_mode is not None:
+            values["ocr_mode"] = ocr_mode
+        if ocr_dpi is not None:
+            values["ocr_dpi"] = ocr_dpi
         checked = Config(values)
         if _host:
             _host.close()
@@ -106,7 +113,12 @@ def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | N
         _engine, _jobs = None, Jobs(checked.data_dir)
         _host = WorkerHost(_jobs)
         _host.start()
-        return {"config": str(config_path()), "data_dir": str(checked.data_dir), "embedding_model": checked.model}
+        # 指紋が変われば取り込み済みの PDF の入れ直しが要る。抽出の設定も変われば OCR もやり直す（ADR-0014）。
+        return {"config": str(config_path()), "data_dir": str(checked.data_dir), "embedding_model": checked.model,
+                "ocr_mode": checked.ocr_mode, "ocr_dpi": checked.ocr_dpi,
+                # 保存先を変えると、前の保存先の索引も抽出の結果も引き継がない。
+                "reingest_required": checked.fingerprint != current.fingerprint or checked.data_dir != current.data_dir,
+                "extraction_changed": checked.extraction_key != current.extraction_key or checked.data_dir != current.data_dir}
 
 
 @server.tool()

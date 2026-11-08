@@ -22,6 +22,10 @@ MODELS = {
 DEFAULT_MODEL = "cl-nagoya/ruri-v3-130m"
 DEFAULT_REVISION = "e3114c6ee10dbab8b4b235fbc6dcf9dd4d5ac1a6"
 OCR_REVISION = "e57f7c6bd9cfb3de5f12f008e71ad2122bd44bfd"
+# ページの判定（文字化け、縦書き、スキャン）やテキストの取り出し方を変えたら上げる。抽出をやり直す（ADR-0014）。
+EXTRACT_REVISION = "extract-v1"
+# 0.4.0 の抽出は extract-v1 にあたる。0.4.0 が wiki ごとに置いた結果を移すのは、この版のときだけ。
+LEGACY_EXTRACT_REVISION = "extract-v1"
 MODEL_REVISIONS = {
     "cl-nagoya/ruri-v3-30m": "24899e5de370b56d179604a007c0d727bf144504",
     "cl-nagoya/ruri-v3-70m": "07a8b0aba47d29d2ca21f89b915c1efe2c23d1cc",
@@ -133,7 +137,33 @@ class Config:
     def fingerprint(self) -> str:
         policy = ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
                   self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
+        # 抽出の版を上げたら、索引の方針も変わる（取り込み直しで抽出と埋め込みをやり直す）。extract-v1 のあいだは、
+        # 0.4.0 の索引をそのまま使えるよう、0.4.0 と同じ値にする（ADR-0014）。
+        if EXTRACT_REVISION != LEGACY_EXTRACT_REVISION:
+            policy.append(EXTRACT_REVISION)
         return hashlib.sha256(json.dumps(policy).encode("utf-8")).hexdigest()
+
+    @property
+    def extraction_key(self) -> str:
+        """抽出の結果の鍵。埋め込みのモデル、分割、題名は入れない（ADR-0014）。"""
+        return f"{self.ocr_mode}-{self.ocr_dpi}-{OCR_REVISION[:12]}-{EXTRACT_REVISION}"
+
+    @property
+    def extraction_root(self) -> Path:
+        """同じ data_dir を使う wiki のあいだで共有する、抽出の結果の置き場所。"""
+        return self.data_dir / "extracted"
+
+    def extraction_dir(self, doc_id: str) -> Path:
+        return self.extraction_root / doc_id / self.extraction_key
+
+    @property
+    def adopts_legacy_extraction(self) -> bool:
+        """0.4.0 が wiki ごとに置いた抽出の結果（extract-v1）を、今の抽出の版の結果として使えるなら True。"""
+        return EXTRACT_REVISION == LEGACY_EXTRACT_REVISION
+
+    def generation(self, doc_id: str) -> str:
+        """索引の行と埋め込みの途中経過の鍵。指紋（抽出の版を含む）が変われば変わるので、前の方針の途中経過を使い回さない。"""
+        return hashlib.sha256((doc_id + self.fingerprint).encode("ascii")).hexdigest()
 
     @staticmethod
     def pdf_source(source: str) -> str:
