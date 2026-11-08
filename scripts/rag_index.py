@@ -15,7 +15,7 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from rag_config import Config, write_json
+from rag_config import MODELS, Config, write_json
 from rag_pdf import chunks_for, extract_pages
 
 
@@ -209,7 +209,14 @@ class Engine:
     def _reset_index(self, folder: Path, connection, stale: dict) -> None:
         """方針が変わった索引を空にする。先に取り込み直す文書の一覧を残し、途中で止まっても、
         次の取り込みでもう一度空にすれば同じ状態になるようにする（ADR-0014）。"""
-        documents = {**self._previous_documents(folder), **self._catalog_documents(connection)}
+        documents = self._previous_documents(folder)
+        for doc_id, item in self._catalog_documents(connection).items():
+            if doc_id in documents:
+                # 取り込み直しの途中でもう一度空にするとき、場所とソースのページを落とさない。
+                before = documents[doc_id]
+                item = {**item, "paths": list(dict.fromkeys(item["paths"] + before["paths"])),
+                        "source_pages": sorted(set(item["source_pages"]) | set(before["source_pages"]))}
+            documents[doc_id] = item
         write_json(folder / "previous-index.json", {"fingerprint": stale["fingerprint"], "model": stale.get("model"),
                                                     "documents": list(documents.values())})
         for table in ("documents", "locations", "citations", "jobs"):
@@ -240,10 +247,27 @@ class Engine:
         self.config.extraction_root.mkdir(parents=True, exist_ok=True)
         return FileLock(str(self.config.extraction_root / f"{doc_id}.lock"), timeout=timeout)
 
-    def _adopt_legacy_extraction(self, folder: Path, generation: str, cache: Path) -> None:
-        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。指紋が同じなので抽出の設定も同じ。"""
-        legacy = folder / "extracted" / generation
-        if not legacy.is_dir() or any(cache.glob("page-*.json")):
+    def _legacy_generations(self, doc_id: str, stale: dict | None) -> list[str]:
+        """0.4.0 が抽出の結果を置いた generation の候補。今の指紋のものと、索引の方針が埋め込みのモデルだけ
+        違うときは、そのときの指紋のもの。どちらも、抽出の設定が今と同じであることが指紋から分かる。"""
+        fingerprints = [self.config.fingerprint]
+        if stale and stale.get("model") in MODELS:
+            try:
+                previous = Config({**self.config.values, "data_dir": str(self.config.data_dir),
+                                   "embedding_model": stale["model"], "embedding_revision": stale.get("revision")})
+            except ValueError:
+                previous = None
+            if previous is not None and previous.fingerprint == stale["fingerprint"]:
+                fingerprints.append(stale["fingerprint"])
+        return [hashlib.sha256((doc_id + value).encode("ascii")).hexdigest() for value in fingerprints]
+
+    def _adopt_legacy_extraction(self, folder: Path, generations: list[str], cache: Path) -> None:
+        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。抽出の設定が同じものだけを移す。"""
+        for generation in generations:
+            legacy = folder / "extracted" / generation
+            if legacy.is_dir() and not any(cache.glob("page-*.json")):
+                break
+        else:
             return
         cache.mkdir(parents=True, exist_ok=True)
         for item in legacy.iterdir():
@@ -258,18 +282,39 @@ class Engine:
     def _extraction_in_use(self, doc_id: str) -> bool:
         """同じ data_dir のどこかの wiki が、その文書を索引に持つか、取り込み直しを待っていれば True。"""
         for workspace in (self.config.data_dir / "wikis-v2").glob("*"):
-            if doc_id in self._previous_documents(workspace):
-                return True
             catalog = workspace / "catalog.sqlite"
             if not catalog.exists():
+                if doc_id in self._previous_documents(workspace):
+                    return True
                 continue
-            with closing(sqlite3.connect(catalog, timeout=15)) as connection:
-                try:
+            try:
+                with closing(sqlite3.connect(catalog, timeout=15)) as connection:
+                    connection.row_factory = sqlite3.Row
                     if connection.execute("SELECT 1 FROM documents WHERE doc_id=?", (doc_id,)).fetchone():
                         return True
-                except sqlite3.OperationalError:
-                    return True  # 読めない台帳があれば、消さずに残す
+                    # 取り込み直しの一覧は、まだ取り込み直していない文書だけを使用中とみなす。
+                    if any(item["sha256"] == doc_id for item in self._reingest(workspace, connection)):
+                        return True
+            except (sqlite3.Error, OSError, ValueError, KeyError):
+                return True  # 読めない台帳があれば、消さずに残す
         return False
+
+    def _prune_previous(self, folder: Path, connection) -> None:
+        """取り込み直しの一覧から、取り込み直した文書と置き換えられた文書を外し、外した文書の抽出の結果を後始末する。"""
+        previous = self._previous_documents(folder)
+        if not previous:
+            return
+        pending = self._reingest(folder, connection)
+        if pending:
+            data = json.loads((folder / "previous-index.json").read_text(encoding="utf-8"))
+            write_json(folder / "previous-index.json", {**data, "documents": pending})
+        else:
+            (folder / "previous-index.json").unlink(missing_ok=True)
+        current = {row[0] for row in connection.execute("SELECT doc_id FROM documents")}
+        keep = {item["sha256"] for item in pending} | current
+        for doc_id in previous:
+            if doc_id not in keep:
+                self._remove_extraction(doc_id)
 
     def _remove_extraction(self, doc_id: str) -> None:
         """どの wiki も使わなくなった文書の抽出の結果を、抽出の設定によらずすべて消す。"""
@@ -378,7 +423,7 @@ class Engine:
                 # 抽出の結果は wiki のあいだで共有する。使っているあいだは、ほかの取り込みの後始末で消させない。
                 held.enter_context(self._extraction_lock(doc_id))
                 cache = self.config.extraction_dir(doc_id)
-                self._adopt_legacy_extraction(folder, generation, cache)
+                self._adopt_legacy_extraction(folder, self._legacy_generations(doc_id, stale), cache)
                 markdown = cache / "document.md"
                 existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
                 if existing:
@@ -401,13 +446,11 @@ class Engine:
                             temporary = markdown.with_name(markdown.name + ".tmp")
                             temporary.write_text("\n\n".join(f"## p. {page['page']}\n\n{page['text']}" for page in pages), encoding="utf-8")
                             os.replace(temporary, markdown)
-                        if stale:
-                            self._reset_index(folder, connection, stale)
-                            stale, index_reset = None, True
-                            connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
-                            connection.commit()
-                        table = self._table(folder, create=True)
-                        completed = connection.execute("SELECT completed FROM jobs WHERE generation=?", (generation,)).fetchone()[0]
+                        # 方針が変わった索引は、最初のバッチの埋め込みが済んでから空にする。モデルの取得や読み込みに
+                        # 失敗しても、前の索引を壊さない。設定を戻せば、前の索引をそのまま使える。
+                        table = None if stale else self._table(folder, create=True)
+                        completed = 0 if stale else connection.execute(
+                            "SELECT completed FROM jobs WHERE generation=?", (generation,)).fetchone()[0]
                         for start in range(completed, len(chunks), self.config.batch_size):
                             if progress:
                                 progress("埋め込み", start, len(chunks))
@@ -423,6 +466,13 @@ class Engine:
                                 rows.append({"chunk_id": f"{generation}:{number}", "doc_id": doc_id, "generation": generation,
                                              "page": chunk["page"], "section": chunk["section"], "title": title,
                                              "text": chunk["text"], "terms": self.tokenize(chunk["embedding_text"]), "vector": vector})
+                            if stale:
+                                self._reset_index(folder, connection, stale)
+                                stale, index_reset = None, True
+                                connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
+                                connection.commit()
+                            if table is None:
+                                table = self._table(folder, create=True)
                             table.merge_insert("chunk_id").when_matched_update_all().when_not_matched_insert_all().execute(rows)
                             connection.execute("UPDATE jobs SET completed=?, error=NULL WHERE generation=?", (start + len(batch), generation))
                             connection.commit()
@@ -482,6 +532,10 @@ class Engine:
                                        (place, doc_id, stat_after.st_size, stat_after.st_mtime_ns,
                                         now if place == location else now - 1e-6, *(same_file or (None, None))))
                 connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, source_page))
+                # 索引を空にする前に、この文書を出典にしていたページも戻す。版が変わったときの要再確認の印に使う。
+                restored = self._previous_documents(folder).get(doc_id)
+                for page in restored["source_pages"] if restored else []:
+                    connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, page))
                 # 改名した同じ内容の資料は、存在しなくなった旧パスだけを台帳から外す。
                 for row in connection.execute("SELECT path FROM locations WHERE doc_id=?", (doc_id,)).fetchall():
                     if not os.path.exists(row["path"]):
@@ -498,17 +552,26 @@ class Engine:
                 connection.commit()
                 # コミット後の保守が失敗しても、新版は検索できる。旧行は active generation の条件で除外する。
                 cleanup_error = None
+                try:
+                    # 取り込み直しの一覧から、取り込み直した文書と置き換えられた文書を外す。すべて外れたら一覧を消す。
+                    self._prune_previous(folder, connection)
+                except Exception as error:
+                    cleanup_error = str(error)
                 for old_id, old_generation in removed:
                     try:
                         self._table(folder).delete(f"doc_id = '{old_id}'")
                         self._maintain_indexes(folder,self._table(folder))
-                        # 抽出の結果は、同じ data_dir のどの wiki も使わなくなったときだけ消す（ADR-0014）。
-                        self._remove_extraction(old_id)
                     except Exception as error:
                         cleanup_error = str(error)
-                # すべて取り込み直したら、取り込み直しの一覧を消す。
-                if (folder / "previous-index.json").exists() and not self._reingest(folder, connection):
-                    (folder / "previous-index.json").unlink(missing_ok=True)
+                    try:
+                        # 抽出の結果は、同じ data_dir のどの wiki も使わなくなったときだけ消す（ADR-0014）。
+                        self._remove_extraction(old_id)
+                        # 0.4.0 がこの wiki に置いたまま移していない結果も消す。
+                        shutil.rmtree(folder / "extracted" / old_generation, ignore_errors=True)
+                        if (folder / "extracted").is_dir() and not any((folder / "extracted").iterdir()):
+                            (folder / "extracted").rmdir()
+                    except Exception as error:
+                        cleanup_error = str(error)
                 return {"status": "unchanged" if skipped else "indexed", "document_id": doc_id,
                         "raw": path.as_posix(), "sha256": doc_id, "pages": pages_count, "chunks": chunks_count,
                         "extracted_markdown": str(markdown), "source_page": source_page,

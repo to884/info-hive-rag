@@ -116,8 +116,9 @@ def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | N
         # 指紋が変われば取り込み済みの PDF の入れ直しが要る。抽出の設定も変われば OCR もやり直す（ADR-0014）。
         return {"config": str(config_path()), "data_dir": str(checked.data_dir), "embedding_model": checked.model,
                 "ocr_mode": checked.ocr_mode, "ocr_dpi": checked.ocr_dpi,
-                "reingest_required": checked.fingerprint != current.fingerprint,
-                "extraction_changed": checked.extraction_key != current.extraction_key}
+                # 保存先を変えると、前の保存先の索引も抽出の結果も引き継がない。
+                "reingest_required": checked.fingerprint != current.fingerprint or checked.data_dir != current.data_dir,
+                "extraction_changed": checked.extraction_key != current.extraction_key or checked.data_dir != current.data_dir}
 
 
 @server.tool()
