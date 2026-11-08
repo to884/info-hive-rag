@@ -217,8 +217,13 @@ class Engine:
                 item = {**item, "paths": list(dict.fromkeys(item["paths"] + before["paths"])),
                         "source_pages": sorted(set(item["source_pages"]) | set(before["source_pages"]))}
             documents[doc_id] = item
+        # 空にしたあとも 0.4.0 の抽出の結果を探せるよう、これまでの方針も残す。
+        policies = self._previous_policies(folder)
+        policy = {key: stale.get(key) for key in ("fingerprint", "model", "revision")}
+        if policy not in policies:
+            policies.append(policy)
         write_json(folder / "previous-index.json", {"fingerprint": stale["fingerprint"], "model": stale.get("model"),
-                                                    "documents": list(documents.values())})
+                                                    "policies": policies, "documents": list(documents.values())})
         for table in ("documents", "locations", "citations", "jobs"):
             connection.execute(f"DELETE FROM {table}")
         connection.commit()
@@ -247,31 +252,47 @@ class Engine:
         self.config.extraction_root.mkdir(parents=True, exist_ok=True)
         return FileLock(str(self.config.extraction_root / f"{doc_id}.lock"), timeout=timeout)
 
-    def _legacy_generations(self, doc_id: str, stale: dict | None) -> list[str]:
-        """0.4.0 が抽出の結果を置いた generation の候補。今の指紋のものと、索引の方針が埋め込みのモデルだけ
-        違うときは、そのときの指紋のもの。どちらも、抽出の設定が今と同じであることが指紋から分かる。"""
+    @staticmethod
+    def _write_markdown(markdown: Path, pages: list[dict]) -> None:
+        """document.md は題名を含まないので、wiki によらない。途中で止まっても半端なファイルを残さない。"""
+        temporary = markdown.with_name(markdown.name + ".tmp")
+        temporary.write_text("\n\n".join(f"## p. {page['page']}\n\n{page['text']}" for page in pages), encoding="utf-8")
+        os.replace(temporary, markdown)
+
+    @staticmethod
+    def _previous_policies(folder: Path) -> list[dict]:
+        path = folder / "previous-index.json"
+        if not path.exists():
+            return []
+        return list(json.loads(path.read_text(encoding="utf-8")).get("policies", []))
+
+    def _legacy_generations(self, folder: Path, doc_id: str, stale: dict | None) -> list[str]:
+        """0.4.0 が抽出の結果を置いた generation の候補。今の指紋のものと、前の方針（今の索引の方針と、空にした
+        索引の方針）のうち埋め込みのモデルだけが違うもの。どれも、抽出の設定が今と同じであることが指紋から分かる。"""
         fingerprints = [self.config.fingerprint]
-        if stale and stale.get("model") in MODELS:
+        for policy in ([stale] if stale else []) + self._previous_policies(folder):
+            if policy.get("model") not in MODELS or policy.get("fingerprint") in fingerprints:
+                continue
             try:
                 previous = Config({**self.config.values, "data_dir": str(self.config.data_dir),
-                                   "embedding_model": stale["model"], "embedding_revision": stale.get("revision")})
+                                   "embedding_model": policy["model"], "embedding_revision": policy.get("revision")})
             except ValueError:
-                previous = None
-            if previous is not None and previous.fingerprint == stale["fingerprint"]:
-                fingerprints.append(stale["fingerprint"])
+                continue
+            if previous.fingerprint == policy["fingerprint"]:
+                fingerprints.append(policy["fingerprint"])
         return [hashlib.sha256((doc_id + value).encode("ascii")).hexdigest() for value in fingerprints]
 
     def _adopt_legacy_extraction(self, folder: Path, generations: list[str], cache: Path) -> None:
-        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。抽出の設定が同じものだけを移す。"""
-        for generation in generations:
-            legacy = folder / "extracted" / generation
-            if legacy.is_dir() and not any(cache.glob("page-*.json")):
-                break
-        else:
+        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。抽出の設定が同じものだけを移す。
+        移す途中で止まっても、次の取り込みで、まだ移していないファイルを移す。"""
+        legacy = next((folder / "extracted" / generation for generation in generations
+                       if (folder / "extracted" / generation).is_dir()), None)
+        if legacy is None:
             return
         cache.mkdir(parents=True, exist_ok=True)
         for item in legacy.iterdir():
-            if item.is_file() and (item.name == "document.md" or re.fullmatch(r"page-\d{6}\.json", item.name)):
+            if item.is_file() and (item.name == "document.md" or re.fullmatch(r"page-\d{6}\.json", item.name)) \
+                    and not (cache / item.name).exists():
                 os.replace(item, cache / item.name)
         shutil.rmtree(legacy, ignore_errors=True)
         try:
@@ -423,12 +444,16 @@ class Engine:
                 # 抽出の結果は wiki のあいだで共有する。使っているあいだは、ほかの取り込みの後始末で消させない。
                 held.enter_context(self._extraction_lock(doc_id))
                 cache = self.config.extraction_dir(doc_id)
-                self._adopt_legacy_extraction(folder, self._legacy_generations(doc_id, stale), cache)
+                self._adopt_legacy_extraction(folder, self._legacy_generations(folder, doc_id, stale), cache)
                 markdown = cache / "document.md"
                 existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
                 if existing:
                     pages_count, chunks_count = existing["pages"], existing["chunks"]
                     skipped = True
+                    if not markdown.exists():
+                        # 索引にはあるが、今の抽出の設定の結果がない（抽出の版を上げた、結果を消したなど）。
+                        # 索引は作り直さず、返す本文のために抽出だけをやり直す。
+                        self._write_markdown(markdown, self.extractor(data, self.config, cache, progress))
                 else:
                     skipped = False
                     if not stale:
@@ -442,10 +467,7 @@ class Engine:
                             raise ValueError("検索できるテキストがありません。取り込みは完了していません。")
                         pages_count, chunks_count = len(pages), len(chunks)
                         if not markdown.exists():
-                            # document.md は題名を含まないので、wiki によらない。途中で止まっても半端なファイルを残さない。
-                            temporary = markdown.with_name(markdown.name + ".tmp")
-                            temporary.write_text("\n\n".join(f"## p. {page['page']}\n\n{page['text']}" for page in pages), encoding="utf-8")
-                            os.replace(temporary, markdown)
+                            self._write_markdown(markdown, pages)
                         # 方針が変わった索引は、最初のバッチの埋め込みが済んでから空にする。モデルの取得や読み込みに
                         # 失敗しても、前の索引を壊さない。設定を戻せば、前の索引をそのまま使える。
                         table = None if stale else self._table(folder, create=True)
