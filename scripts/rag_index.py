@@ -209,14 +209,7 @@ class Engine:
     def _reset_index(self, folder: Path, connection, stale: dict) -> None:
         """方針が変わった索引を空にする。先に取り込み直す文書の一覧を残し、途中で止まっても、
         次の取り込みでもう一度空にすれば同じ状態になるようにする（ADR-0014）。"""
-        documents = self._previous_documents(folder)
-        for doc_id, item in self._catalog_documents(connection).items():
-            if doc_id in documents:
-                # 取り込み直しの途中でもう一度空にするとき、場所とソースのページを落とさない。
-                before = documents[doc_id]
-                item = {**item, "paths": list(dict.fromkeys(item["paths"] + before["paths"])),
-                        "source_pages": sorted(set(item["source_pages"]) | set(before["source_pages"]))}
-            documents[doc_id] = item
+        documents = self._merge_documents(self._previous_documents(folder), self._catalog_documents(connection))
         # 空にしたあとも 0.4.0 の抽出の結果を探せるよう、これまでの方針も残す。
         policies = self._previous_policies(folder)
         policy = {key: stale.get(key) for key in ("fingerprint", "model", "revision")}
@@ -236,19 +229,40 @@ class Engine:
         (folder / "index-state.json").unlink(missing_ok=True)
         self._write_policy(folder)
 
+    @staticmethod
+    def _merge_documents(previous: dict, current: dict) -> dict:
+        """取り込み直しの一覧と台帳の文書を合わせる。同じ文書は、場所とソースのページの和をとる。
+        取り込み直しの途中でもう一度設定を変えても、まだ取り込み直していない場所やページを落とさない。"""
+        documents = dict(previous)
+        for doc_id, item in current.items():
+            if doc_id in documents:
+                before = documents[doc_id]
+                item = {**item, "paths": list(dict.fromkeys(item["paths"] + before["paths"])),
+                        "source_pages": sorted(set(item["source_pages"]) | set(before["source_pages"]))}
+            documents[doc_id] = item
+        return documents
+
+    @staticmethod
+    def _gone(place: str) -> bool:
+        """その場所の PDF が消えたと言えるなら True。フォルダーはあるのにファイルだけがないときに限る。
+        ネットワークドライブが切れているときなど、フォルダーごと見えないときは、消えたとはみなさない。"""
+        try:
+            return not os.path.exists(place) and os.path.isdir(os.path.dirname(place))
+        except OSError:
+            return False
+
     def _reingest(self, folder: Path, connection) -> list[dict]:
         """取り込み直すべき文書。方針が変わった索引の文書と、空にする前に残した一覧のうち、まだ取り込み直していない場所。
-        同じ内容を 2 か所で登録していれば、片方を取り込み直しても、もう片方が残る。台帳に載っている場所と、もうない
-        場所は外す。場所が残らない文書は外す。"""
+        同じ内容を 2 か所で登録していれば、片方を取り込み直しても、もう片方が残る。台帳に載っている場所と、消えたと言える
+        場所（_gone）は外す。場所が残らない文書は外す。"""
         pending = self._previous_documents(folder)
         current = self._catalog_documents(connection)
         if self._stale_policy(folder):
-            pending.update(current)
-            return list(pending.values())
+            return list(self._merge_documents(pending, current).values())
         placed = {place for item in current.values() for place in item["paths"]}
         result = []
         for doc_id, item in pending.items():
-            paths = [place for place in item["paths"] if place not in placed and os.path.exists(place)]
+            paths = [place for place in item["paths"] if place not in placed and not self._gone(place)]
             if paths:
                 result.append({**item, "paths": paths})
         return result
