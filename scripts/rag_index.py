@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import time
 from datetime import timedelta
 from contextlib import ExitStack, closing, contextmanager
@@ -244,10 +245,18 @@ class Engine:
 
     @staticmethod
     def _gone(place: str) -> bool:
-        """その場所の PDF が消えたと言えるなら True。フォルダーはあるのにファイルだけがないときに限る。
-        ネットワークドライブが切れているときなど、フォルダーごと見えないときは、消えたとはみなさない。"""
+        """その場所の PDF が消えたと言えるなら True。ファイルがない（FileNotFoundError）と分かり、フォルダーは
+        見えるときに限る。ネットワークドライブが切れてフォルダーごと見えないときや、権限が足りずにファイルを
+        確かめられないときは、消えたとはみなさない。os.path.exists() は権限の不足も偽にするので使わない。"""
         try:
-            return not os.path.exists(place) and os.path.isdir(os.path.dirname(place))
+            os.stat(place)
+            return False
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        try:
+            return stat.S_ISDIR(os.stat(os.path.dirname(place)).st_mode)
         except OSError:
             return False
 
