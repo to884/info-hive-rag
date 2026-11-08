@@ -22,6 +22,8 @@ MODELS = {
 DEFAULT_MODEL = "cl-nagoya/ruri-v3-130m"
 DEFAULT_REVISION = "e3114c6ee10dbab8b4b235fbc6dcf9dd4d5ac1a6"
 OCR_REVISION = "e57f7c6bd9cfb3de5f12f008e71ad2122bd44bfd"
+# ページの判定（文字化け、縦書き、スキャン）やテキストの取り出し方を変えたら上げる。抽出をやり直す（ADR-0014）。
+EXTRACT_REVISION = "extract-v1"
 MODEL_REVISIONS = {
     "cl-nagoya/ruri-v3-30m": "24899e5de370b56d179604a007c0d727bf144504",
     "cl-nagoya/ruri-v3-70m": "07a8b0aba47d29d2ca21f89b915c1efe2c23d1cc",
@@ -134,6 +136,19 @@ class Config:
         policy = ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
                   self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
         return hashlib.sha256(json.dumps(policy).encode("utf-8")).hexdigest()
+
+    @property
+    def extraction_key(self) -> str:
+        """抽出の結果の鍵。埋め込みのモデル、分割、題名は入れない（ADR-0014）。"""
+        return f"{self.ocr_mode}-{self.ocr_dpi}-{OCR_REVISION[:12]}-{EXTRACT_REVISION}"
+
+    @property
+    def extraction_root(self) -> Path:
+        """同じ data_dir を使う wiki のあいだで共有する、抽出の結果の置き場所。"""
+        return self.data_dir / "extracted"
+
+    def extraction_dir(self, doc_id: str) -> Path:
+        return self.extraction_root / doc_id / self.extraction_key
 
     @staticmethod
     def pdf_source(source: str) -> str:

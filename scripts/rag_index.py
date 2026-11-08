@@ -6,13 +6,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 from datetime import timedelta
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from rag_config import Config, write_json
 from rag_pdf import chunks_for, extract_pages
@@ -167,15 +168,119 @@ class Engine:
         ])
         return database.create_table("chunks", schema=schema, exist_ok=True)
 
-    def _check_policy(self, folder: Path) -> None:
+    def _write_policy(self, folder: Path) -> None:
+        write_json(folder / "policy.json", {"fingerprint": self.config.fingerprint, "model": self.config.model,
+                                            "revision": self.config.revision, "dimension": self.config.dimension})
+
+    def _stale_policy(self, folder: Path) -> dict | None:
+        """索引の方針が今の設定と違えば、記録した方針を返す。同じか、まだ索引がなければ None を返す。"""
         path = folder / "policy.json"
-        if path.exists():
-            previous = json.loads(path.read_text(encoding="utf-8"))
-            if previous["fingerprint"] != self.config.fingerprint:
-                raise ValueError("索引と設定が異なります。モデルや分割方法の変更には全 PDF の再投入が必要です。別の data_dir で構築してください。")
-        else:
-            write_json(path, {"fingerprint": self.config.fingerprint, "model": self.config.model,
-                              "revision": self.config.revision, "dimension": self.config.dimension})
+        if not path.exists():
+            return None
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        return previous if previous["fingerprint"] != self.config.fingerprint else None
+
+    def _check_policy(self, folder: Path) -> None:
+        """検索と索引の保守の前に呼ぶ。方針が変わった索引は、取り込み直すまで使わない（ADR-0014）。"""
+        if self._stale_policy(folder):
+            raise ValueError("埋め込みのモデル、分割、OCR の設定が変わったので、PDF を取り込み直すまで検索できません。"
+                             "取り込み直す PDF は status の reingest で確かめてください。")
+        if not (folder / "policy.json").exists():
+            self._write_policy(folder)
+
+    @staticmethod
+    def _previous_documents(folder: Path) -> dict:
+        path = folder / "previous-index.json"
+        if not path.exists():
+            return {}
+        return {item["sha256"]: item for item in json.loads(path.read_text(encoding="utf-8"))["documents"]}
+
+    @staticmethod
+    def _catalog_documents(connection) -> dict:
+        documents = {}
+        for row in connection.execute("SELECT doc_id,title FROM documents ORDER BY ingested_at"):
+            paths = [Path(item[0]).as_posix() for item in connection.execute(
+                "SELECT path FROM locations WHERE doc_id=? ORDER BY confirmed_at DESC", (row["doc_id"],))]
+            pages = [item[0] for item in connection.execute(
+                "SELECT source_page FROM citations WHERE doc_id=? ORDER BY source_page", (row["doc_id"],))]
+            documents[row["doc_id"]] = {"sha256": row["doc_id"], "title": row["title"], "paths": paths, "source_pages": pages}
+        return documents
+
+    def _reset_index(self, folder: Path, connection, stale: dict) -> None:
+        """方針が変わった索引を空にする。先に取り込み直す文書の一覧を残し、途中で止まっても、
+        次の取り込みでもう一度空にすれば同じ状態になるようにする（ADR-0014）。"""
+        documents = {**self._previous_documents(folder), **self._catalog_documents(connection)}
+        write_json(folder / "previous-index.json", {"fingerprint": stale["fingerprint"], "model": stale.get("model"),
+                                                    "documents": list(documents.values())})
+        for table in ("documents", "locations", "citations", "jobs"):
+            connection.execute(f"DELETE FROM {table}")
+        connection.commit()
+        import lancedb
+        database = lancedb.connect(str(folder / "lance"), read_consistency_interval=timedelta(0))
+        try:
+            database.drop_table("chunks")
+        except (FileNotFoundError, ValueError):
+            pass
+        (folder / "index-state.json").unlink(missing_ok=True)
+        self._write_policy(folder)
+
+    def _reingest(self, folder: Path, connection) -> list[dict]:
+        """取り込み直すべき文書。方針が変わった索引の文書と、空にする前に残した一覧のうち、まだ取り込み直していないもの。"""
+        pending = self._previous_documents(folder)
+        current = self._catalog_documents(connection)
+        if self._stale_policy(folder):
+            pending.update(current)
+            return list(pending.values())
+        # 取り込み直した文書と、すべての場所に別の版を取り込み直した文書は外す。
+        placed = {place for item in current.values() for place in item["paths"]}
+        return [item for doc_id, item in pending.items()
+                if doc_id not in current and not (item["paths"] and set(item["paths"]) <= placed)]
+
+    def _extraction_lock(self, doc_id: str, timeout: float = 1800) -> FileLock:
+        self.config.extraction_root.mkdir(parents=True, exist_ok=True)
+        return FileLock(str(self.config.extraction_root / f"{doc_id}.lock"), timeout=timeout)
+
+    def _adopt_legacy_extraction(self, folder: Path, generation: str, cache: Path) -> None:
+        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。指紋が同じなので抽出の設定も同じ。"""
+        legacy = folder / "extracted" / generation
+        if not legacy.is_dir() or any(cache.glob("page-*.json")):
+            return
+        cache.mkdir(parents=True, exist_ok=True)
+        for item in legacy.iterdir():
+            if item.is_file() and (item.name == "document.md" or re.fullmatch(r"page-\d{6}\.json", item.name)):
+                os.replace(item, cache / item.name)
+        shutil.rmtree(legacy, ignore_errors=True)
+        try:
+            (folder / "extracted").rmdir()
+        except OSError:
+            pass
+
+    def _extraction_in_use(self, doc_id: str) -> bool:
+        """同じ data_dir のどこかの wiki が、その文書を索引に持つか、取り込み直しを待っていれば True。"""
+        for workspace in (self.config.data_dir / "wikis-v2").glob("*"):
+            if doc_id in self._previous_documents(workspace):
+                return True
+            catalog = workspace / "catalog.sqlite"
+            if not catalog.exists():
+                continue
+            with closing(sqlite3.connect(catalog, timeout=15)) as connection:
+                try:
+                    if connection.execute("SELECT 1 FROM documents WHERE doc_id=?", (doc_id,)).fetchone():
+                        return True
+                except sqlite3.OperationalError:
+                    return True  # 読めない台帳があれば、消さずに残す
+        return False
+
+    def _remove_extraction(self, doc_id: str) -> None:
+        """どの wiki も使わなくなった文書の抽出の結果を、抽出の設定によらずすべて消す。"""
+        try:
+            with self._extraction_lock(doc_id, timeout=0):
+                if not self._extraction_in_use(doc_id):
+                    shutil.rmtree(self.config.extraction_root / doc_id)
+        except Timeout:
+            pass  # ほかの取り込みが使っている。消さずに残す
+        except FileNotFoundError:
+            pass
 
     @staticmethod
     def _location(connection, doc_id: str) -> str | None:
@@ -209,10 +314,11 @@ class Engine:
             table=self._table(folder)
             return self._maintain_indexes(folder,table,progress) if table is not None else {'ann_ready':False,'rows':0}
 
-    def _mark_reviews(self, wiki: Path, connection, doc_id: str) -> list[str]:
+    def _mark_reviews(self, wiki: Path, connection, doc_id: str, cited=()) -> list[str]:
         import yaml
 
         direct = {row[0] for row in connection.execute("SELECT source_page FROM citations WHERE doc_id=?", (doc_id,))}
+        direct.update(cited)
         slugs = {Path(page).stem for page in direct}
         affected = []
         for page in wiki.rglob("*.md"):
@@ -254,8 +360,12 @@ class Engine:
         location = str(path)
         source_page = self._source_page(wiki, source_page)
         folder.mkdir(parents=True, exist_ok=True)
-        with FileLock(str(folder / "write.lock"), timeout=1800):
-            self._check_policy(folder)
+        with FileLock(str(folder / "write.lock"), timeout=1800), ExitStack() as held:
+            # 方針が変わった索引は、抽出が済んでから空にする。それまでは台帳の文書を今の方針のものとみなさない。
+            stale = self._stale_policy(folder)
+            if not stale and not (folder / "policy.json").exists():
+                self._write_policy(folder)
+            index_reset = False
             with self._catalog(folder) as connection:
                 if progress:
                     progress("PDF の読み込み", 0, 1)
@@ -265,16 +375,20 @@ class Engine:
                     progress("PDF の読み込み", 1, 1)
                 doc_id = hashlib.sha256(data).hexdigest()
                 generation = hashlib.sha256((doc_id + self.config.fingerprint).encode("ascii")).hexdigest()
-                existing = connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+                # 抽出の結果は wiki のあいだで共有する。使っているあいだは、ほかの取り込みの後始末で消させない。
+                held.enter_context(self._extraction_lock(doc_id))
+                cache = self.config.extraction_dir(doc_id)
+                self._adopt_legacy_extraction(folder, generation, cache)
+                markdown = cache / "document.md"
+                existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
                 if existing:
                     pages_count, chunks_count = existing["pages"], existing["chunks"]
-                    markdown = folder / "extracted" / generation / "document.md"
                     skipped = True
                 else:
                     skipped = False
-                    cache = folder / "extracted" / generation
-                    connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
-                    connection.commit()
+                    if not stale:
+                        connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
+                        connection.commit()
                     try:
                         pages = self.extractor(data, self.config, cache, progress)
                         title = title.strip() or path.stem
@@ -282,8 +396,16 @@ class Engine:
                         if not chunks:
                             raise ValueError("検索できるテキストがありません。取り込みは完了していません。")
                         pages_count, chunks_count = len(pages), len(chunks)
-                        markdown = cache / "document.md"
-                        markdown.write_text("\n\n".join(f"## p. {page['page']}\n\n{page['text']}" for page in pages), encoding="utf-8")
+                        if not markdown.exists():
+                            # document.md は題名を含まないので、wiki によらない。途中で止まっても半端なファイルを残さない。
+                            temporary = markdown.with_name(markdown.name + ".tmp")
+                            temporary.write_text("\n\n".join(f"## p. {page['page']}\n\n{page['text']}" for page in pages), encoding="utf-8")
+                            os.replace(temporary, markdown)
+                        if stale:
+                            self._reset_index(folder, connection, stale)
+                            stale, index_reset = None, True
+                            connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
+                            connection.commit()
                         table = self._table(folder, create=True)
                         completed = connection.execute("SELECT completed FROM jobs WHERE generation=?", (generation,)).fetchone()[0]
                         for start in range(completed, len(chunks), self.config.batch_size):
@@ -343,7 +465,12 @@ class Engine:
                 for row in vanished:
                     connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
                 # 新しい索引が揃うまでは旧版を検索対象として残す。
-                reviews = sorted({page for old_id in old_ids for page in self._mark_reviews(wiki, connection, old_id)})
+                reviews = {page for old_id in old_ids for page in self._mark_reviews(wiki, connection, old_id)}
+                # 索引を空にしたあとは、この場所の前の版を台帳で引けない。取り込み直しの一覧から引く。
+                for item in self._previous_documents(folder).values():
+                    if item["sha256"] != doc_id and path.as_posix() in item["paths"]:
+                        reviews.update(self._mark_reviews(wiki, connection, item["sha256"], item["source_pages"]))
+                reviews = sorted(reviews)
                 connection.execute("""INSERT OR REPLACE INTO documents
                     (doc_id,generation,title,pages,chunks,fingerprint,ingested_at)
                     VALUES (?,?,?,?,?,?,?)""",
@@ -375,16 +502,17 @@ class Engine:
                     try:
                         self._table(folder).delete(f"doc_id = '{old_id}'")
                         self._maintain_indexes(folder,self._table(folder))
-                        old_cache = folder / "extracted" / old_generation
-                        for cached in old_cache.glob("*.json"):
-                            cached.unlink()
-                        (old_cache / "document.md").unlink(missing_ok=True)
+                        # 抽出の結果は、同じ data_dir のどの wiki も使わなくなったときだけ消す（ADR-0014）。
+                        self._remove_extraction(old_id)
                     except Exception as error:
                         cleanup_error = str(error)
+                # すべて取り込み直したら、取り込み直しの一覧を消す。
+                if (folder / "previous-index.json").exists() and not self._reingest(folder, connection):
+                    (folder / "previous-index.json").unlink(missing_ok=True)
                 return {"status": "unchanged" if skipped else "indexed", "document_id": doc_id,
                         "raw": path.as_posix(), "sha256": doc_id, "pages": pages_count, "chunks": chunks_count,
                         "extracted_markdown": str(markdown), "source_page": source_page,
-                        "review_pages": reviews, "cleanup_error": cleanup_error,
+                        "review_pages": reviews, "cleanup_error": cleanup_error, "index_reset": index_reset,
                         "indexes":json.loads((folder/'index-state.json').read_text(encoding='utf-8'))}
 
     def search(self, wiki_root: str, query: str, limit: int = 10) -> dict:
@@ -444,10 +572,14 @@ class Engine:
     def status(self, wiki_root: str) -> dict:
         folder = self.config.workspace(wiki_root)
         if not (folder / "catalog.sqlite").exists():
-            return {"documents": 0, "chunks": 0, "jobs": [], "data_dir": str(folder)}
+            return {"documents": 0, "chunks": 0, "jobs": [], "data_dir": str(folder),
+                    "reingest_required": False, "reingest": []}
         with self._catalog(folder) as connection:
             counts = connection.execute("SELECT COUNT(*),COALESCE(SUM(chunks),0) FROM documents").fetchone()
             jobs = [dict(row) for row in connection.execute("SELECT generation,completed,status,error FROM jobs WHERE status != 'complete'")]
             index_state=folder/'index-state.json'
+            # 設定が変わった索引の文書と、空にしたあとまだ取り込み直していない文書（ADR-0014）。
+            reingest = self._reingest(folder, connection)
             return {"documents": counts[0], "chunks": counts[1], "jobs": jobs, "data_dir": str(folder),
-                    "indexes":json.loads(index_state.read_text(encoding='utf-8')) if index_state.exists() else None}
+                    "indexes":json.loads(index_state.read_text(encoding='utf-8')) if index_state.exists() else None,
+                    "reingest_required": bool(reingest), "reingest": reingest}
