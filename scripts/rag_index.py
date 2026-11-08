@@ -36,7 +36,11 @@ def read_pdf(path: Path, expected: tuple | None = None) -> tuple[bytes, os.stat_
     違えば読まない。登録のあとで親のフォルダーが差し替えられても、別のファイルを読まないため。
     """
     before = os.lstat(path)
-    with open(path, "rb") as handle:
+    try:
+        handle = open(path, "rb")
+    except OSError as error:
+        raise ValueError(f"PDF を開けません（{error.strerror or error}）。") from error
+    with handle:
         opened = os.fstat(handle.fileno())
         if not _same_file(before, opened):
             raise ValueError("確かめた PDF と開いたファイルが違います。もう一度取り込んでください。")
@@ -45,7 +49,12 @@ def read_pdf(path: Path, expected: tuple | None = None) -> tuple[bytes, os.stat_
             if (opened.st_size, opened.st_mtime_ns) != (size, mtime_ns) or (
                     ino not in (None, "", "0", 0) and file_id(opened) != (str(dev), str(ino))):
                 raise ValueError("登録した PDF と開いたファイルが違います。新しいジョブで取り込んでください。")
-        data = handle.read()
+        try:
+            data = handle.read()
+        except OSError as error:
+            # OneDrive などのオンラインだけのファイルは、同期のアプリが動いていないと読めない（Errno 22 になる）。
+            raise ValueError(f"PDF を読めません（{error.strerror or error}）。OneDrive などのオンラインだけの"
+                             "ファイルなら、同期のアプリを起動してから、もう一度取り込んでください。") from error
         after = os.fstat(handle.fileno())
     if not _same_file(opened, after) or len(data) != after.st_size:
         raise ValueError("読み込み中に PDF が変更されました。もう一度取り込んでください。")
