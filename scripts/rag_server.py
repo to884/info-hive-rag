@@ -79,7 +79,7 @@ def engine() -> Engine:
 
 @server.tool()
 def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | None = None,
-              ocr_mode: str = "", ocr_dpi: int = 0) -> dict:
+              ocr_mode: str | None = None, ocr_dpi: int | None = None) -> dict:
     """派生データの保存先、埋め込みのモデル、検索の設定、OCR の設定（ocr_mode は auto / always / off、ocr_dpi は 72〜300）を、
     この PC の設定に保存する。指定しない項目は今の設定のまま。PDF は登録のときに絶対パスで渡す。
     reingest_required が true なら取り込み済みの PDF の入れ直しが要り、extraction_changed が true なら入れ直しで OCR もやり直す。"""
@@ -101,9 +101,9 @@ def configure(data_dir: str = "", embedding_model: str = "", retrieval: dict | N
             if set(retrieval) - allowed:
                 raise ValueError("retrieval に未対応の設定名があります。")
             values.update(retrieval)
-        if ocr_mode:
+        if ocr_mode is not None:
             values["ocr_mode"] = ocr_mode
-        if ocr_dpi:
+        if ocr_dpi is not None:
             values["ocr_dpi"] = ocr_dpi
         checked = Config(values)
         if _host:

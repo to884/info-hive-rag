@@ -237,16 +237,21 @@ class Engine:
         self._write_policy(folder)
 
     def _reingest(self, folder: Path, connection) -> list[dict]:
-        """取り込み直すべき文書。方針が変わった索引の文書と、空にする前に残した一覧のうち、まだ取り込み直していないもの。"""
+        """取り込み直すべき文書。方針が変わった索引の文書と、空にする前に残した一覧のうち、まだ取り込み直していない場所。
+        同じ内容を 2 か所で登録していれば、片方を取り込み直しても、もう片方が残る。台帳に載っている場所と、もうない
+        場所は外す。場所が残らない文書は外す。"""
         pending = self._previous_documents(folder)
         current = self._catalog_documents(connection)
         if self._stale_policy(folder):
             pending.update(current)
             return list(pending.values())
-        # 取り込み直した文書と、すべての場所に別の版を取り込み直した文書は外す。
         placed = {place for item in current.values() for place in item["paths"]}
-        return [item for doc_id, item in pending.items()
-                if doc_id not in current and not (item["paths"] and set(item["paths"]) <= placed)]
+        result = []
+        for doc_id, item in pending.items():
+            paths = [place for place in item["paths"] if place not in placed and os.path.exists(place)]
+            if paths:
+                result.append({**item, "paths": paths})
+        return result
 
     def _extraction_lock(self, doc_id: str, timeout: float = 1800) -> FileLock:
         self.config.extraction_root.mkdir(parents=True, exist_ok=True)
@@ -267,8 +272,9 @@ class Engine:
         return list(json.loads(path.read_text(encoding="utf-8")).get("policies", []))
 
     def _legacy_generations(self, folder: Path, doc_id: str, stale: dict | None) -> list[str]:
-        """0.4.0 が抽出の結果を置いた generation の候補。今の指紋のものと、前の方針（今の索引の方針と、空にした
-        索引の方針）のうち埋め込みのモデルだけが違うもの。どれも、抽出の設定が今と同じであることが指紋から分かる。"""
+        """0.4.0 が抽出の結果を置いた generation（0.4.0 の式 sha256(doc_id + 指紋)）の候補。今の指紋のものと、
+        前の方針（今の索引の方針と、空にした索引の方針）のうち埋め込みのモデルだけが違うもの。どれも、OCR の設定が
+        今と同じであることが指紋から分かる。抽出の版は指紋に入らないので、移すかどうかは呼び出し側が版で決める。"""
         fingerprints = [self.config.fingerprint]
         for policy in ([stale] if stale else []) + self._previous_policies(folder):
             if policy.get("model") not in MODELS or policy.get("fingerprint") in fingerprints:
@@ -282,9 +288,22 @@ class Engine:
                 fingerprints.append(policy["fingerprint"])
         return [hashlib.sha256((doc_id + value).encode("ascii")).hexdigest() for value in fingerprints]
 
+    @staticmethod
+    def _remove_legacy_extraction(folder: Path, generations: list[str]) -> None:
+        """0.4.0 が wiki の作業領域に置いたまま移していない抽出の結果を消す。"""
+        for generation in generations:
+            shutil.rmtree(folder / "extracted" / generation, ignore_errors=True)
+        try:
+            (folder / "extracted").rmdir()
+        except OSError:
+            pass
+
     def _adopt_legacy_extraction(self, folder: Path, generations: list[str], cache: Path) -> None:
-        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。抽出の設定が同じものだけを移す。
+        """0.4.0 が wiki の作業領域に置いた抽出の結果を、新しい置き場所に移す。OCR の設定が同じものだけを移す。
+        0.4.0 の結果は extract-v1 の抽出なので、抽出の版を上げたあとは移さない（古い本文を新しい版の結果にしない）。
         移す途中で止まっても、次の取り込みで、まだ移していないファイルを移す。"""
+        if not self.config.adopts_legacy_extraction:
+            return
         legacy = next((folder / "extracted" / generation for generation in generations
                        if (folder / "extracted" / generation).is_dir()), None)
         if legacy is None:
@@ -326,6 +345,8 @@ class Engine:
         if not previous:
             return
         pending = self._reingest(folder, connection)
+        # 一覧を消す前に、0.4.0 の置き場所を探すための方針を読んでおく。
+        legacy = {doc_id: self._legacy_generations(folder, doc_id, None) for doc_id in previous}
         if pending:
             data = json.loads((folder / "previous-index.json").read_text(encoding="utf-8"))
             write_json(folder / "previous-index.json", {**data, "documents": pending})
@@ -336,6 +357,7 @@ class Engine:
         for doc_id in previous:
             if doc_id not in keep:
                 self._remove_extraction(doc_id)
+                self._remove_legacy_extraction(folder, legacy[doc_id])
 
     def _remove_extraction(self, doc_id: str) -> None:
         """どの wiki も使わなくなった文書の抽出の結果を、抽出の設定によらずすべて消す。"""
@@ -440,7 +462,7 @@ class Engine:
                 if progress:
                     progress("PDF の読み込み", 1, 1)
                 doc_id = hashlib.sha256(data).hexdigest()
-                generation = hashlib.sha256((doc_id + self.config.fingerprint).encode("ascii")).hexdigest()
+                generation = self.config.generation(doc_id)
                 # 抽出の結果は wiki のあいだで共有する。使っているあいだは、ほかの取り込みの後始末で消させない。
                 held.enter_context(self._extraction_lock(doc_id))
                 cache = self.config.extraction_dir(doc_id)
@@ -449,6 +471,8 @@ class Engine:
                 existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
                 if existing:
                     pages_count, chunks_count = existing["pages"], existing["chunks"]
+                    # 索引の行は、記録した generation で入っている（抽出の版を上げる前の式のこともある）。
+                    generation = existing["generation"]
                     skipped = True
                     if not markdown.exists():
                         # 索引にはあるが、今の抽出の設定の結果がない（抽出の版を上げた、結果を消したなど）。
@@ -564,13 +588,16 @@ class Engine:
                         connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
                 connection.execute("UPDATE jobs SET status='complete', error=NULL WHERE generation=?", (generation,))
                 removed = []
+                old_rows = {old_id: connection.execute("SELECT generation FROM documents WHERE doc_id=?", (old_id,)).fetchall()
+                            for old_id in old_ids}
                 for old_id in old_ids:
                     if not connection.execute("SELECT 1 FROM locations WHERE doc_id=?", (old_id,)).fetchone():
                         connection.execute("DELETE FROM documents WHERE doc_id=?", (old_id,))
                         # 内部の途中経過も消す。同じ内容に戻したとき、埋め込みを最初からやり直すため。
-                        old_generation = hashlib.sha256((old_id + self.config.fingerprint).encode("ascii")).hexdigest()
-                        connection.execute("DELETE FROM jobs WHERE generation=?", (old_generation,))
-                        removed.append((old_id, old_generation))
+                        # 記録した generation は、抽出の版を上げる前の式のこともあるので、今の式の値と両方を消す。
+                        old_generations = {self.config.generation(old_id), *(row[0] for row in old_rows.get(old_id, []))}
+                        connection.executemany("DELETE FROM jobs WHERE generation=?", [(value,) for value in old_generations])
+                        removed.append((old_id, self._legacy_generations(folder, old_id, None)))
                 connection.commit()
                 # コミット後の保守が失敗しても、新版は検索できる。旧行は active generation の条件で除外する。
                 cleanup_error = None
@@ -579,7 +606,7 @@ class Engine:
                     self._prune_previous(folder, connection)
                 except Exception as error:
                     cleanup_error = str(error)
-                for old_id, old_generation in removed:
+                for old_id, legacy_generations in removed:
                     try:
                         self._table(folder).delete(f"doc_id = '{old_id}'")
                         self._maintain_indexes(folder,self._table(folder))
@@ -589,9 +616,7 @@ class Engine:
                         # 抽出の結果は、同じ data_dir のどの wiki も使わなくなったときだけ消す（ADR-0014）。
                         self._remove_extraction(old_id)
                         # 0.4.0 がこの wiki に置いたまま移していない結果も消す。
-                        shutil.rmtree(folder / "extracted" / old_generation, ignore_errors=True)
-                        if (folder / "extracted").is_dir() and not any((folder / "extracted").iterdir()):
-                            (folder / "extracted").rmdir()
+                        self._remove_legacy_extraction(folder, legacy_generations)
                     except Exception as error:
                         cleanup_error = str(error)
                 return {"status": "unchanged" if skipped else "indexed", "document_id": doc_id,
