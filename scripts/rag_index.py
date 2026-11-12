@@ -31,14 +31,17 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
         second.st_dev, second.st_ino, second.st_size, second.st_mtime_ns)
 
 
-# PDF のヘッダー（%PDF-）の前に置けるバイト数の上限。PDFium は、先頭から 1024 バイト目までに始まる
+# PDF のヘッダー（%PDF-）の前に置けるバイト数の上限。PDFium は、開始位置（0 始まり）が 0〜1024 の
 # ヘッダーを探して開く（pypdfium2 5.14.0、PDFium 156 で、前置きが 1024 バイトなら開け、1025 バイトなら
 # 開けないことを確かめた）。先頭に改行などがあるだけの PDF を、PDFium が開けるのに拒まないため。
 PDF_HEADER_OFFSET_LIMIT = 1024
 
 
 def has_pdf_header(data: bytes) -> bool:
-    """%PDF- が、先頭から PDF_HEADER_OFFSET_LIMIT バイト目までのどこかで始まっていれば True。"""
+    """%PDF- の前にあるバイトが PDF_HEADER_OFFSET_LIMIT バイト以下なら True。
+
+    言い換えると、%PDF- の開始位置（0 始まり）が 0〜PDF_HEADER_OFFSET_LIMIT のどこかであれば True。
+    """
     return data.find(b"%PDF-", 0, PDF_HEADER_OFFSET_LIMIT + len(b"%PDF-")) != -1
 
 
