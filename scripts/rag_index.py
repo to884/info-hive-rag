@@ -31,6 +31,17 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
         second.st_dev, second.st_ino, second.st_size, second.st_mtime_ns)
 
 
+# PDF のヘッダー（%PDF-）の前に置けるバイト数の上限。PDFium は、先頭から 1024 バイト目までに始まる
+# ヘッダーを探して開く（pypdfium2 5.14.0、PDFium 156 で、前置きが 1024 バイトなら開け、1025 バイトなら
+# 開けないことを確かめた）。先頭に改行などがあるだけの PDF を、PDFium が開けるのに拒まないため。
+PDF_HEADER_OFFSET_LIMIT = 1024
+
+
+def has_pdf_header(data: bytes) -> bool:
+    """%PDF- が、先頭から PDF_HEADER_OFFSET_LIMIT バイト目までのどこかで始まっていれば True。"""
+    return data.find(b"%PDF-", 0, PDF_HEADER_OFFSET_LIMIT + len(b"%PDF-")) != -1
+
+
 def read_pdf(path: Path, expected: tuple | None = None) -> tuple[bytes, os.stat_result]:
     """確かめたファイルを 1 回だけ開いて読み、読んだバイト列が PDF であることを確かめる（ADR-0013）。
 
@@ -60,8 +71,8 @@ def read_pdf(path: Path, expected: tuple | None = None) -> tuple[bytes, os.stat_
         after = os.fstat(handle.fileno())
     if not _same_file(opened, after) or len(data) != after.st_size:
         raise ValueError("読み込み中に PDF が変更されました。もう一度取り込んでください。")
-    if not data.startswith(b"%PDF-"):
-        raise ValueError("PDF の形式ではありません（先頭が %PDF- ではない）。")
+    if not has_pdf_header(data):
+        raise ValueError(f"PDF の形式ではありません（先頭の {PDF_HEADER_OFFSET_LIMIT} バイトに %PDF- がない）。")
     return data, after
 
 

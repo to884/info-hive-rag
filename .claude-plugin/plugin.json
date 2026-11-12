@@ -1,6 +1,6 @@
 {
   "name": "rag",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "wiki@info-hive に依存し、PDF の抽出・OCR・埋め込みを永続ジョブで進め、中断後の再開とローカル検索を提供する Claude Code プラグイン。",
   "dependencies": [
     "wiki@info-hive"
