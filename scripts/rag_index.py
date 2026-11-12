@@ -75,7 +75,8 @@ def read_pdf(path: Path, expected: tuple | None = None) -> tuple[bytes, os.stat_
     if not _same_file(opened, after) or len(data) != after.st_size:
         raise ValueError("読み込み中に PDF が変更されました。もう一度取り込んでください。")
     if not has_pdf_header(data):
-        raise ValueError(f"PDF の形式ではありません（先頭の {PDF_HEADER_OFFSET_LIMIT} バイトに %PDF- がない）。")
+        raise ValueError(f"PDF の形式ではありません（%PDF- がないか、最初の %PDF- の前に "
+                         f"{PDF_HEADER_OFFSET_LIMIT} バイトを超えるバイトがある）。")
     return data, after
 
 
