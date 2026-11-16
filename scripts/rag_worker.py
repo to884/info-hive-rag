@@ -139,30 +139,52 @@ def run(data_dir: str):
             if key != engine_key:
                 engine, engine_key = Engine(config), key
             return engine
+        streak = 0
         while True:
-            request = jobs.claim_search()
-            if request:
+            if time.monotonic() - reconciled > 60:
+                # 検索が続いていても、1 分おきに、台帳と公開した版の差から作り直しのジョブを登録し直す
                 try:
-                    result = get_engine(request["config"]).search(request["wiki"], request["query"], request["result_limit"])
-                    jobs.finish_search(request["id"], result=result)
+                    reconcile_rebuilds(jobs)
+                except Exception:
+                    pass
+                reconciled = time.monotonic()
+            kind, item, streak = next_work(jobs, owner, streak)
+            if kind == "search":
+                try:
+                    result = get_engine(item["config"]).search(item["wiki"], item["query"], item["result_limit"])
+                    jobs.finish_search(item["id"], result=result)
                 except Exception as error:
-                    jobs.finish_search(request["id"], error=str(error))
-                continue
-            job = jobs.claim(owner)
-            if job is None:
-                if time.monotonic() - reconciled > 60:
-                    # 待っているあいだも、台帳と公開した版の差から、作り直しのジョブを登録し直す
-                    try:
-                        reconcile_rebuilds(jobs)
-                    except Exception:
-                        pass
-                    reconciled = time.monotonic()
+                    jobs.finish_search(item["id"], error=str(error))
+            elif kind == "job":
+                process_job(jobs, owner, item, get_engine(engine_config(jobs, item)))
+            else:
                 time.sleep(.02)
-                continue
-            process_job(jobs, owner, job, get_engine(engine_config(jobs, job)))
     finally:
         jobs.pause(owner)
         lock.release()
+
+
+# 検索を続けて処理するのは、この件数まで。そのあとは、待っているジョブを 1 つ処理する
+SEARCH_STREAK_LIMIT = 10
+
+
+def next_work(jobs: Jobs, owner: str, streak: int) -> tuple[str | None, dict | None, int]:
+    """次に処理するもの（"search"、"job"、None）と、それと、続けて処理した検索の数を返す。
+
+    検索を優先するが、SEARCH_STREAK_LIMIT 件続けたら、待っているジョブを先に取る。複数の接続から検索が途切れなく
+    来ても、取り込みと、確認を当てる作り直しに順番が回る（受け付けた確認を、いつか索引に反映するため。ADR-0025）。
+    """
+    if streak < SEARCH_STREAK_LIMIT:
+        request = jobs.claim_search()
+        if request:
+            return "search", request, streak + 1
+    job = jobs.claim(owner)
+    if job is not None:
+        return "job", job, 0
+    request = jobs.claim_search()
+    if request:
+        return "search", request, 1
+    return None, None, 0
 
 
 def engine_config(jobs: Jobs, job: dict) -> str:
