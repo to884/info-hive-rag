@@ -178,7 +178,7 @@ def reconcile_rebuilds(jobs: Jobs) -> list[dict]:
         for wiki, doc_id, version in pending_rebuilds(jobs.data_dir, config.fingerprint):
             try:
                 # 走査で読んだ版を受け持たせる。その版を受け持ったジョブが（取り消し、失敗を含めて）あれば登録しない
-                registered = jobs.register_rebuild(config, wiki, doc_id, version, only_if_uncovered=True)
+                registered = jobs.register_rebuild(config, wiki, doc_id, version)
             except ValueError:
                 continue  # wiki を消したなど
             if registered:

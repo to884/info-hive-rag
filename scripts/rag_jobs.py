@@ -85,8 +85,7 @@ class Jobs:
                      json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
-    def register_rebuild(self, config: Config, wiki_root: str, doc_id: str, version: int,
-                         only_if_uncovered: bool = False) -> dict | None:
+    def register_rebuild(self, config: Config, wiki_root: str, doc_id: str, version: int) -> dict | None:
         """台帳の版 version を受け持つ、確認の結果を当てる作り直しのジョブを登録する（ADR-0025）。wiki と PDF ごとに 1 つ。
 
         ジョブの行が、受け持つ台帳の版（review_version）を持つ。確かめることと登録することを、ジョブの DB の 1 つの
@@ -94,15 +93,16 @@ class Jobs:
 
         - 同じ wiki と PDF の作り直しが待っていれば、それに version を受け持たせて返す（始めるときに台帳の最新の版を読む）。
         - 処理中なら rerun の印も付け、終わったときにもう一度待ちに戻す（処理中に受け付けた確認を取りこぼさない）。
-        - only_if_uncovered が真（状態からの登録し直し）なら、version を受け持ったジョブが状態によらずあれば、登録しない
-          （取り消したジョブと失敗したジョブを、利用者の明示的な再試行なしに復活させない）。None を返す。
+        - version を受け持ったジョブが、状態によらず（取り消し、失敗、完了を含めて）あれば、登録せずに None を返す。
+          確認を受け付けた側と、状態からの登録し直しの、どちらが先に登録しても、同じ版を 2 度登録しない。取り消したジョブと
+          失敗したジョブを、利用者の明示的な再試行なしに復活させない。受け持ったジョブは rebuild_for で引ける。
         """
         wiki = Path(wiki_root).expanduser().resolve()
         config.workspace(str(wiki))
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if only_if_uncovered and db.execute("""SELECT 1 FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
+            if db.execute("""SELECT 1 FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
                     AND review_version>=? LIMIT 1""", (str(wiki), doc_id, int(version))).fetchone():
                 return None
             row = db.execute("""SELECT id,status FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
@@ -122,6 +122,14 @@ class Jobs:
                     (identity, str(wiki), "", "", "", 0, 0, json.dumps(config.snapshot(), ensure_ascii=False), now, now,
                      "review:" + identity, "review", doc_id, "確認の結果を当てる作り直しを受付", int(version)))
         return self.status(str(wiki), identity)
+
+    def rebuild_for(self, wiki_root: str, doc_id: str, version: int) -> dict | None:
+        """台帳の版 version を受け持った、いちばん新しい作り直しのジョブ。"""
+        wiki = str(Path(wiki_root).expanduser().resolve())
+        with self.connect() as db:
+            row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND review_version>=?
+                ORDER BY created_at DESC LIMIT 1""", (wiki, doc_id, int(version))).fetchone()
+        return self.status(wiki, row[0]) if row else None
 
     def status(self, wiki_root: str, job_id: str, page_report_from: int = 0, threshold: float | None = None) -> dict:
         """ジョブの状態を返す。結果の page_report の一覧は、page_report_from の位置から 200 個の範囲を返す。
@@ -152,6 +160,10 @@ class Jobs:
             report = self._with_review(report, job_config, wiki, result["result"].get("sha256") or result.get("doc_id"),
                                        threshold)
             result["result"]["page_report"] = render_page_report(report, page_report_from)
+            published = report.get("review", {}).get("extracted_markdown")
+            if published:
+                # 確認を当てた本文は、公開している版のものを返す（前の版の本文は、次の版を公開したときに消える）
+                result["result"]["extracted_markdown"] = published
         return result
 
     @staticmethod
@@ -296,7 +308,8 @@ class Jobs:
             db.execute("BEGIN IMMEDIATE")
             # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
             if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
-                                            "rerun=0,result=?,owner=NULL,updated_at=? WHERE id=? AND owner=? AND status='running' "
+                                            "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=? "
+                                            "WHERE id=? AND owner=? AND status='running' "
                                             "AND kind='review' AND rerun=1",
                                             (json.dumps(result, ensure_ascii=False) if result is not None else None,
                                              time.time(), identity, owner)).rowcount:
@@ -329,10 +342,12 @@ class Jobs:
                 row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND id!=?
                     AND status IN ('queued','running','paused') LIMIT 1""", (current["wiki"], current["doc_id"], job_id)).fetchone()
                 if row is None:
-                    db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,updated_at=? "
-                               "WHERE id=? AND status IN ('failed','cancelled')", (time.time(), job_id))
+                    db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,"
+                               "publication_started=0,updated_at=? WHERE id=? AND status IN ('failed','cancelled')",
+                               (time.time(), job_id))
             return self.status(current["wiki"], row[0] if row else job_id)
         with self.connect() as db:
-            db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,updated_at=? WHERE id=? AND status IN ('failed','cancelled')",
-                       (time.time(), job_id))
+            # 前の試行の「公開を始めた」印を戻す（新しい試行は、まだ公開を始めていないので取り消せる）
+            db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,publication_started=0,"
+                       "updated_at=? WHERE id=? AND status IN ('failed','cancelled')", (time.time(), job_id))
         return self.status(current["wiki"], job_id)

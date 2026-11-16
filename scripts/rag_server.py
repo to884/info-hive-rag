@@ -173,8 +173,10 @@ def decide_ocr_pages(wiki_root: str, job_id: str, base_version: int, decisions: 
     with _lock:
         doc_id = jobs().completed_document(wiki_root, job_id)
         version = decide(configuration(), wiki_root, doc_id, base_version, decisions)
-        # この版を受け持つ作り直しのジョブを登録する。台帳に書いたあと、ここまでに止まっても、ワーカーが状態から登録し直す
-        rebuild = jobs().register_rebuild(configuration(), wiki_root, doc_id, version)
+        # この版を受け持つ作り直しのジョブを登録する。台帳に書いたあと、ここまでに止まっても、ワーカーが状態から登録し直す。
+        # ワーカーが先に登録していれば（取り消されていても）、そのジョブを返す
+        rebuild = jobs().register_rebuild(configuration(), wiki_root, doc_id, version) \
+            or jobs().rebuild_for(wiki_root, doc_id, version)
     return {"ledger_version": version, "rebuild_job": rebuild}
 
 
