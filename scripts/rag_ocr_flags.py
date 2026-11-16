@@ -7,7 +7,8 @@
 - "rapid": 横書きの行の画像を、別の認識器（RapidOCR の日本語の認識モデル）で読んだ本文（rapid_text）が、採った本文に
   ない英数字か記号を足すか置き換えた。NDLOCR-Lite の 3 つの認識器がそろって落とす文字（ローマ数字、注の番号など）を捕える。
   RapidOCR が文字を落としただけの違い（RapidOCR の文字の一覧にない記号）、見た目の同じ文字の違い、取り違えやすい英数字
-  どうし（O と 0 と o、l と 1 と I と |）の入れ替えは数えない（RapidOCR 自身がよく読み違える）。
+  どうし（O と 0 と o、l と 1 と I と |）の入れ替えは数えない（RapidOCR 自身がよく読み違える）。差分の区切り方に
+  左右されないよう、文字の数で比べる（rapid_added）。
 
 "blur"、"alt"、"rapid" は、OCR したときに決まるので、OCR の結果と一緒に保存する（static_flags）。
 本文の比べ方と、行の対応と、読む順は、承認の条件 5 の測定（docs/research/adr-0025-condition5-2026-11-16/scripts/score.py）と
@@ -19,7 +20,7 @@ from __future__ import annotations
 import unicodedata
 
 # 印の決め方を変えたら上げる（保存した印は、版が違えば「不明」として扱う）
-OCR_FLAG_REVISION = "flags-v2"
+OCR_FLAG_REVISION = "flags-v3"
 # 別の解像度の食い違いを印にするのは、行の確信度がこの値より低いときだけ
 ALT_CONFIDENCE_LIMIT = 0.9
 # 見た目の同じ記号をそろえる表（測定と同じ）
@@ -28,11 +29,12 @@ SAME = {**{c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"}, 
         "\uff65": "\u30fb", "\u00b7": "\u30fb", "\u25cb": "\u3007"}
 
 
-# 2 つの認識器の読みを比べるときだけ、見た目の同じ文字をそろえる（カタカナと漢字、長音とダッシュ）
+# 2 つの認識器の読みを比べるときだけ、見た目の同じ文字をそろえる（カタカナと漢字、長音と漢数字の一とダッシュ）。
+# 長音と一とダッシュは、記号の "-" にそろえる（負号の足し忘れを、記号の違いとして数えるため）
 LOOKALIKE = {"卜": "ト", "口": "ロ", "力": "カ", "工": "エ", "夕": "タ", "二": "ニ", "八": "ハ", "才": "オ",
-             "一": "ー", "-": "ー", "へ": "ヘ", "べ": "ベ", "ぺ": "ペ", "り": "リ"}
-# 取り違えやすい英数字の組。この組の中だけの 1 文字ずつの入れ替えは、"rapid" の印にしない
-AMBIGUOUS = (frozenset("O0o"), frozenset("l1I|"))
+             "一": "-", "ー": "-", "へ": "ヘ", "べ": "ベ", "ぺ": "ペ", "り": "リ"}
+# 取り違えやすい英数字の組。数えるときは組の代表の文字にそろえるので、組の中の入れ替えは "rapid" の印にならない
+AMBIGUOUS = {**{c: "O" for c in "O0o"}, **{c: "l" for c in "l1I|"}}
 
 
 def alt_dpi(ocr_dpi: int) -> int:
@@ -119,21 +121,30 @@ def skeleton(text: str) -> str:
     return "".join(LOOKALIKE.get(c, c) for c in normalize(text))
 
 
-def rapid_added(text: str, rapid_text: str) -> bool:
-    """別の認識器の読みが、採った本文にない英数字か記号を足すか置き換えたか（"rapid" の印の決まり）。"""
-    import difflib
+def _counted(text: str):
+    """数えるための形。skeleton のあと、取り違えやすい英数字を組の代表にそろえ、文字ごとの数を返す。"""
+    from collections import Counter
 
-    a, b = skeleton(text), skeleton(rapid_text)
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
-        if tag in ("equal", "delete"):
-            continue
-        old, new = a[i1:i2], b[j1:j2]
-        if tag == "replace" and len(old) == len(new) and all(
-                any(x in group and y in group for group in AMBIGUOUS) for x, y in zip(old, new)):
-            continue
-        if any((c.isascii() and c.isalnum()) or not c.isalnum() for c in new + old):
-            return True
-    return False
+    return Counter(AMBIGUOUS.get(c, c) for c in skeleton(text))
+
+
+def _marked(c: str) -> bool:
+    """英数字（ASCII）か記号（文字でも数字でもない文字）か。"""
+    return (c.isascii() and c.isalnum()) or not c.isalnum()
+
+
+def rapid_added(text: str, rapid_text: str) -> bool:
+    """別の認識器の読みが、採った本文にない英数字か記号を足すか置き換えたか（"rapid" の印の決まり）。
+
+    差分の区切り方に左右されないよう、文字の数で比べる。別の認識器の読みにだけ多い文字（足した文字）に英数字か
+    記号があれば印にする。採った本文にだけ多い英数字か記号があり、かつ何かを足していれば（置き換え）印にする。
+    落としただけ（足した文字がない）は印にしない。並びだけが違う読みも印にしない。
+    """
+    a, b = _counted(text), _counted(rapid_text)
+    added, removed = b - a, a - b
+    if any(_marked(c) for c in added):
+        return True
+    return bool(added) and any(_marked(c) for c in removed)
 
 
 def static_flags(line: dict) -> list[str]:
