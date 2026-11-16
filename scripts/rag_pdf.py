@@ -141,7 +141,12 @@ class OcrStore:
             for saved in sorted(source.glob("page-*.json")):
                 entry = json.loads(saved.read_text(encoding="utf-8"))
                 number = int(entry["page"])
-                if not entry.get("ocr") or self.path(number).exists():
+                if not entry.get("ocr"):
+                    continue
+                if self.path(number).exists():
+                    # 前に写したページ（途中で止まる前）も、その元から移したページとして記録する
+                    if json.loads(self.path(number).read_text(encoding="utf-8")).get("adopted_from") == source.name:
+                        pages.append(number)
                     continue
                 write_json(self.path(number), {
                     "page": number, "text": entry["text"], "line_count": None, "render": UNKNOWN_RENDER,
