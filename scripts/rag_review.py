@@ -51,7 +51,6 @@ class Ledger:
                     action TEXT NOT NULL, text TEXT, decided_by TEXT NOT NULL, ocr_sha256 TEXT NOT NULL,
                     decided_at REAL NOT NULL, PRIMARY KEY (doc_id, version, page));
                 CREATE TABLE IF NOT EXISTS review_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS review_registered (doc_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
             """)
             with db:
                 yield db
@@ -82,20 +81,6 @@ class Ledger:
         with self.connect() as db:
             return {row[0]: int(row[1]) for row in db.execute("SELECT doc_id,version FROM review_versions")}
 
-    def mark_registered(self, doc_id: str, version: int) -> None:
-        """台帳の版 version までの確認について、作り直しのジョブを登録したことを記録する。"""
-        with self.connect() as db:
-            db.execute("""INSERT INTO review_registered VALUES (?,?) ON CONFLICT(doc_id)
-                DO UPDATE SET version=MAX(version, excluded.version)""", (doc_id, int(version)))
-
-    def unregistered(self) -> dict[str, int]:
-        """台帳の版が、作り直しのジョブを登録した版より新しい文書（登録する前に止まった確認がある文書）。"""
-        if not self.path.exists():
-            return {}
-        with self.connect() as db:
-            return {row[0]: int(row[1]) for row in db.execute("""SELECT v.doc_id, v.version FROM review_versions v
-                LEFT JOIN review_registered r ON r.doc_id = v.doc_id WHERE r.version IS NULL OR r.version < v.version""")}
-
     def wiki(self) -> str | None:
         """確認を受け付けた wiki のパス（作り直しのジョブを登録し直すときに使う）。"""
         if not self.path.exists():
@@ -118,6 +103,22 @@ class Ledger:
         upto = [item for item in rows if item["version"] <= published]
         return {"version": int(row[0]) if row else 0, "latest": latest, "published": upto[-1] if upto else None,
                 "history": rows}
+
+    def state(self, doc_id: str, published: int) -> dict:
+        """1 つの読み取りのトランザクションで、台帳の版、ページごとの最新の結果、公開した版までの結果を読む。"""
+        if not self.path.exists():
+            return {"version": 0, "latest": {}, "published": {}}
+        with self.connect() as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT version FROM review_versions WHERE doc_id=?", (doc_id,)).fetchone()
+            rows = [dict(item) for item in db.execute(
+                "SELECT * FROM review_decisions WHERE doc_id=? ORDER BY version", (doc_id,))]
+        latest, upto = {}, {}
+        for item in rows:
+            latest[int(item["page"])] = item
+            if item["version"] <= published:
+                upto[int(item["page"])] = item
+        return {"version": int(row[0]) if row else 0, "latest": latest, "published": upto}
 
     def history(self, doc_id: str, page: int) -> list[dict]:
         if not self.path.exists():
@@ -334,12 +335,12 @@ def published_documents(folder: Path) -> dict[str, dict]:
                 for row in db.execute(f"SELECT doc_id,generation,{version} FROM documents")}
 
 
-def pending_rebuilds(data_dir: Path, fingerprint: str | None = None) -> list[tuple[str, str]]:
-    """確認を台帳に書いたのに、その版の作り直しのジョブを登録していない（wiki, 文書）の組。
+def pending_rebuilds(data_dir: Path, fingerprint: str | None = None) -> list[tuple[str, str, int]]:
+    """台帳の版が、公開した確認の版より新しい（wiki, 文書, 台帳の版）の組。
 
-    確認を台帳に書いたあと、作り直しのジョブを登録する前に止まっても、ここで見つかる（2 つの DB にまたがる取りこぼしを防ぐ）。
-    一度登録した版は、ジョブを取り消したり、ジョブが失敗したりしても、ここには出さない（利用者が決めたことを覆さない。
-    失敗したジョブは、明示的な再試行で動かす）。
+    この中から、その版を受け持つ作り直しのジョブが 1 つもないものだけを、Jobs.register_rebuild が登録する
+    （確認を台帳に書いたあと、登録する前に止まっても取りこぼさない。受け持つジョブを取り消したか、失敗したなら、
+    状態によらず登録し直さない）。
     索引の方針（policy.json の指紋）が fingerprint と違う wiki は外す。作り直しは方針の変わった索引に当てない
     （deferred で終わる）ので、登録し直すと、同じ作り直しを繰り返すことになる。取り込み直したときに当てる。
     """
@@ -353,7 +354,7 @@ def pending_rebuilds(data_dir: Path, fingerprint: str | None = None) -> list[tup
         if fingerprint and policy.exists() and json.loads(policy.read_text(encoding="utf-8")).get("fingerprint") != fingerprint:
             continue
         published = published_documents(folder)
-        for doc_id, version in ledger.unregistered().items():
+        for doc_id, version in ledger.versions().items():
             if doc_id in published and version > published[doc_id]["review_version"]:
-                found.append((wiki, doc_id))
+                found.append((wiki, doc_id, version))
     return found

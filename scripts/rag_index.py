@@ -810,9 +810,8 @@ class Engine:
             summary = load_summary(folder, doc_id, row["generation"])
             if not summary:
                 continue
-            published = ledger.decisions(doc_id, upto=row.get("review_version") or 0)
-            latest = ledger.decisions(doc_id)
-            marks[doc_id] = (summary, published, latest)
+            snapshot = ledger.state(doc_id, row.get("review_version") or 0)  # 1 回の読み取り
+            marks[doc_id] = (summary, snapshot["published"], snapshot["latest"])
         return marks
 
     def _mark(self, marks: dict, doc_id: str, page: int) -> dict | None:
@@ -916,13 +915,13 @@ class Engine:
             summary = load_summary(folder, doc_id, row["generation"])
             if not summary:
                 continue
-            lists = review_lists(summary, ledger.decisions(doc_id), ledger.decisions(doc_id, upto=row["review_version"]),
-                                 self.config.ocr_confidence_threshold)
+            snapshot = ledger.state(doc_id, row["review_version"])  # 1 回の読み取り
+            lists = review_lists(summary, snapshot["latest"], snapshot["published"], self.config.ocr_confidence_threshold)
             pending = len(lists["review:pending"]) + len(lists["review:stale"])
             awaiting = len(lists["review:awaiting_publish"])
             if pending or awaiting:
                 found.append({"sha256": doc_id, "title": row["title"], "pending_pages": pending, "awaiting_publish_pages": awaiting,
-                              "ledger_version": ledger.version(doc_id), "published_version": row["review_version"]})
+                              "ledger_version": snapshot["version"], "published_version": row["review_version"]})
         return {"pending_pages": sum(item["pending_pages"] for item in found),
                 "awaiting_publish_pages": sum(item["awaiting_publish_pages"] for item in found), "documents": found,
                 "threshold": self.config.ocr_confidence_threshold}

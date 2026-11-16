@@ -45,7 +45,7 @@ class Jobs:
             # rag 0.6.0 で、確認を当てる作り直しのジョブ（kind='review'）を足した（ADR-0025）。前の版の台帳には列を足す。
             columns = {row[1] for row in db.execute("PRAGMA table_info(ingest_jobs)")}
             for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'ingest'"), ("doc_id", "TEXT"),
-                                      ("rerun", "INTEGER NOT NULL DEFAULT 0")):
+                                      ("rerun", "INTEGER NOT NULL DEFAULT 0"), ("review_version", "INTEGER")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE ingest_jobs ADD COLUMN {name} {declaration}")
 
@@ -85,31 +85,42 @@ class Jobs:
                      json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
-    def register_rebuild(self, config: Config, wiki_root: str, doc_id: str) -> dict:
-        """確認の結果を当てる作り直しのジョブを登録する。wiki と PDF ごとに 1 つだけ持つ（ADR-0025）。
+    def register_rebuild(self, config: Config, wiki_root: str, doc_id: str, version: int,
+                         only_if_uncovered: bool = False) -> dict | None:
+        """台帳の版 version を受け持つ、確認の結果を当てる作り直しのジョブを登録する（ADR-0025）。wiki と PDF ごとに 1 つ。
 
-        取り込みのジョブの重複の除き方（request_key）は使わない。同じ wiki と PDF の作り直しが待っていれば、それを返す
-        （始めるときに台帳の最新の版を読む）。処理中なら rerun の印を付けて返し、終わったときにもう一度待ちに戻す
-        （処理中に受け付けた確認を取りこぼさない）。
+        ジョブの行が、受け持つ台帳の版（review_version）を持つ。確かめることと登録することを、ジョブの DB の 1 つの
+        トランザクションで行う。取り込みのジョブの重複の除き方（request_key）は使わない。
+
+        - 同じ wiki と PDF の作り直しが待っていれば、それに version を受け持たせて返す（始めるときに台帳の最新の版を読む）。
+        - 処理中なら rerun の印も付け、終わったときにもう一度待ちに戻す（処理中に受け付けた確認を取りこぼさない）。
+        - only_if_uncovered が真（状態からの登録し直し）なら、version を受け持ったジョブが状態によらずあれば、登録しない
+          （取り消したジョブと失敗したジョブを、利用者の明示的な再試行なしに復活させない）。None を返す。
         """
         wiki = Path(wiki_root).expanduser().resolve()
         config.workspace(str(wiki))
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if only_if_uncovered and db.execute("""SELECT 1 FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
+                    AND review_version>=? LIMIT 1""", (str(wiki), doc_id, int(version))).fetchone():
+                return None
             row = db.execute("""SELECT id,status FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
                 AND status IN ('queued','running','paused') ORDER BY created_at DESC LIMIT 1""", (str(wiki), doc_id)).fetchone()
             if row:
                 identity = row["id"]
+                db.execute("UPDATE ingest_jobs SET review_version=MAX(COALESCE(review_version,0),?),updated_at=? WHERE id=?",
+                           (int(version), now, identity))
                 if row["status"] == "running":
                     db.execute("UPDATE ingest_jobs SET rerun=1,updated_at=? WHERE id=?", (now, identity))
             else:
                 identity = uuid.uuid4().hex
                 db.execute("""INSERT INTO ingest_jobs
-                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,kind,doc_id,phase)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,kind,doc_id,phase,
+                     review_version)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (identity, str(wiki), "", "", "", 0, 0, json.dumps(config.snapshot(), ensure_ascii=False), now, now,
-                     "review:" + identity, "review", doc_id, "確認の結果を当てる作り直しを受付"))
+                     "review:" + identity, "review", doc_id, "確認の結果を当てる作り直しを受付", int(version)))
         return self.status(str(wiki), identity)
 
     def status(self, wiki_root: str, job_id: str, page_report_from: int = 0, threshold: float | None = None) -> dict:
@@ -157,15 +168,14 @@ class Jobs:
         published_version, ledger_version, ledger_decisions, published_decisions, published = 0, 0, {}, {}, None
         if doc_id:
             folder = Config(job_config).workspace(wiki)
-            ledger = Ledger(folder)
-            ledger_version = ledger.version(doc_id)
             published = published_documents(folder).get(doc_id)
+            snapshot = Ledger(folder).state(doc_id, published["review_version"] if published else 0)
+            ledger_version = snapshot["version"]
             if published:
                 published_version = published["review_version"]
                 loaded = load_summary(folder, doc_id, published["generation"])
                 summary = loaded if loaded is not None else summary  # 空の要約も、公開している版の正しい結果
-                ledger_decisions = ledger.decisions(doc_id)
-                published_decisions = ledger.decisions(doc_id, upto=published_version)
+                ledger_decisions, published_decisions = snapshot["latest"], snapshot["published"]
         lists = dict(report["lists"])
         for name, numbers in review_lists(summary, ledger_decisions, published_decisions, threshold).items():
             lists[name] = {"count": len(numbers), "ranges": page_ranges(numbers)}

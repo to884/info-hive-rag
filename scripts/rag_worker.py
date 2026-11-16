@@ -175,14 +175,14 @@ def reconcile_rebuilds(jobs: Jobs) -> list[dict]:
         config = Config()
         if Path(config.data_dir) != jobs.data_dir:
             config = Config({**config.values, "data_dir": str(jobs.data_dir)})
-        from rag_review import Ledger
-        for wiki, doc_id in pending_rebuilds(jobs.data_dir, config.fingerprint):
+        for wiki, doc_id, version in pending_rebuilds(jobs.data_dir, config.fingerprint):
             try:
-                found.append(jobs.register_rebuild(config, wiki, doc_id))
-                ledger = Ledger(config.workspace(wiki))
-                ledger.mark_registered(doc_id, ledger.version(doc_id))
+                # 走査で読んだ版を受け持たせる。その版を受け持ったジョブが（取り消し、失敗を含めて）あれば登録しない
+                registered = jobs.register_rebuild(config, wiki, doc_id, version, only_if_uncovered=True)
             except ValueError:
                 continue  # wiki を消したなど
+            if registered:
+                found.append(registered)
         return found
 
 
