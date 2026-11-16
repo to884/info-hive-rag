@@ -79,7 +79,8 @@ class Jobs:
                      json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
-    def status(self, wiki_root: str, job_id: str) -> dict:
+    def status(self, wiki_root: str, job_id: str, page_report_from: int = 0) -> dict:
+        """ジョブの状態を返す。結果の page_report の一覧は、page_report_from の位置から 200 個の範囲を返す。"""
         wiki = str(Path(wiki_root).expanduser().resolve())
         with self.connect() as db:
             row = db.execute("SELECT * FROM ingest_jobs WHERE id=? AND wiki=?", (job_id, wiki)).fetchone()
@@ -93,6 +94,9 @@ class Jobs:
         result.pop("ino")
         result["job_id"] = result.pop("id")
         result["result"] = json.loads(result["result"]) if result["result"] else None
+        if result["result"] and result["result"].get("page_report"):
+            from rag_pdf import render_page_report
+            result["result"]["page_report"] = render_page_report(result["result"]["page_report"], page_report_from)
         return result
 
     def list(self, wiki_root: str) -> list[dict]:

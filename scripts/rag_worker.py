@@ -147,23 +147,30 @@ def run(data_dir: str):
             if job is None:
                 time.sleep(.02)
                 continue
-            try:
-                source = Path(job["source"])
-                stat = source.stat()
-                if (stat.st_size, stat.st_mtime_ns) != (job["size"], job["mtime_ns"]):
-                    raise ValueError("登録後に PDF が変わりました。新しいジョブで取り込んでください。")
-                result = get_engine(job["config"]).ingest_pdf(job["wiki"], job["source"], job["source_page"], job["title"],
-                    progress=lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total),
-                    before_publish=lambda: jobs.begin_publication(job["id"], owner),
-                    expected=(job["dev"], job["ino"], job["size"], job["mtime_ns"]))
-                jobs.finish(job["id"], owner, result=result)
-            except JobCancelled:
-                pass
-            except Exception as error:
-                jobs.finish(job["id"], owner, error=str(error))
+            process_job(jobs, owner, job, get_engine(job["config"]))
     finally:
         jobs.pause(owner)
         lock.release()
+
+
+def process_job(jobs: Jobs, owner: str, job: dict, engine) -> None:
+    """取り出したジョブを 1 件処理し、結果か失敗を台帳に書く。"""
+    try:
+        source = Path(job["source"])
+        stat = source.stat()
+        if (stat.st_size, stat.st_mtime_ns) != (job["size"], job["mtime_ns"]):
+            raise ValueError("登録後に PDF が変わりました。新しいジョブで取り込んでください。")
+        result = engine.ingest_pdf(job["wiki"], job["source"], job["source_page"], job["title"],
+            progress=lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total),
+            before_publish=lambda: jobs.begin_publication(job["id"], owner),
+            expected=(job["dev"], job["ino"], job["size"], job["mtime_ns"]))
+        jobs.finish(job["id"], owner, result=result)
+    except JobCancelled:
+        pass
+    except Exception as error:
+        # 失敗したときも、それまでに処理したページの情報を残す（ADR-0025）
+        report = getattr(error, "page_report", None)
+        jobs.finish(job["id"], owner, error=str(error), result={"page_report": report} if report else None)
 
 
 if __name__ == "__main__":

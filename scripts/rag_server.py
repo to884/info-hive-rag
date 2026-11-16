@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "mcp>=1.28,<2", "lancedb>=0.25,<0.30", "pypdfium2>=5,<6",
+#   "mcp>=1.28,<2", "lancedb>=0.25,<0.30", "pypdfium2==5.15.2", "pdfminer.six==20260107",
 #   "sentence-transformers>=5,<6", "sudachipy>=0.6,<0.8", "sudachidict-core",
 #   "pyyaml>=6,<7", "filelock>=3,<5", "psutil>=7,<8", "torch==2.8.0", "numpy>=2,<3", "pillow>=11,<14", "onnxruntime>=1.31,<2",
 # ]
@@ -135,13 +135,18 @@ def ingest_pdf(wiki_root: str, source: str, source_page: str, title: str = "") -
 
 
 @server.tool()
-async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0) -> dict:
-    """進捗と完了時の抽出 Markdown を返す。wait_seconds=1〜30 で完了を短時間待てる。"""
+async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0, page_report_from: int = 0) -> dict:
+    """進捗と完了時の抽出 Markdown を返す。wait_seconds=1〜30 で完了を短時間待てる。
+    result.page_report は、判定ごとのページ、確かめるべきページ、OCR したページ、OCR の結果が空のページを、
+    続いた番号の範囲で返す（失敗したジョブでも、それまでのページの分を返す）。範囲の数が 200 を超える一覧は
+    next に位置が入るので、page_report_from にその位置を渡して続きを取る。"""
     if not 0 <= wait_seconds <= 30:
         raise ValueError("wait_seconds は 0〜30 にしてください。")
+    if page_report_from < 0:
+        raise ValueError("page_report_from は 0 以上にしてください。")
     deadline = time.monotonic() + wait_seconds
     while True:
-        result = jobs().status(wiki_root, job_id)
+        result = jobs().status(wiki_root, job_id, page_report_from)
         if result["status"] in {"completed", "failed", "cancelled"} or time.monotonic() >= deadline:
             return result
         await asyncio.sleep(.1)
@@ -179,8 +184,10 @@ async def search(wiki_root: str, query: str, limit: int = 10) -> dict:
 
 @server.tool()
 def status(wiki_root: str) -> dict:
-    """取り込み済みの件数と、中断・失敗した処理を確認する。"""
+    """取り込み済みの件数と、中断・失敗した処理を確認する。settings に今の OCR の設定（ocr_mode、ocr_dpi）を返す。"""
     result = engine().status(wiki_root)
+    current = configuration()
+    result["settings"] = {"ocr_mode": current.ocr_mode, "ocr_dpi": current.ocr_dpi}
     result["index_jobs"] = result.pop("jobs")
     result["jobs"] = jobs().list(wiki_root)
     legacy = jobs().legacy_data()
