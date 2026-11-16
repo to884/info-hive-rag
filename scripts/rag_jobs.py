@@ -160,10 +160,14 @@ class Jobs:
             report = self._with_review(report, job_config, wiki, result["result"].get("sha256") or result.get("doc_id"),
                                        threshold)
             result["result"]["page_report"] = render_page_report(report, page_report_from)
-            published = report.get("review", {}).get("extracted_markdown")
-            if published:
+            review = report.get("review", {})
+            if review.get("extracted_markdown"):
                 # 確認を当てた本文は、公開している版のものを返す（前の版の本文は、次の版を公開したときに消える）
-                result["result"]["extracted_markdown"] = published
+                result["result"]["extracted_markdown"] = review["extracted_markdown"]
+            if review.get("indexed"):
+                # 本文に付ける確認の版も、公開している版の値にする
+                result["result"]["review"] = {"ledger_version": review["ledger_version"],
+                                              "published_version": review["published_version"]}
         return result
 
     @staticmethod
@@ -306,6 +310,12 @@ class Jobs:
     def finish(self, identity: str, owner: str, *, result=None, error=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if error is None and isinstance(result, dict):
+                # 作り直しのジョブが受け持つ台帳の版を、実際に公開した版に合わせる。何もせずに終わった（deferred）なら
+                # 手放す（NULL）。受け持ったまま完了すると、公開していない版を二度と登録しなくなる
+                published = (result.get("review") or {}).get("published_version")
+                db.execute("UPDATE ingest_jobs SET review_version=? WHERE id=? AND kind='review' AND rerun=0",
+                           (None if result.get("status") == "deferred" else published, identity))
             # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
             if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
                                             "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=? "

@@ -159,10 +159,23 @@ def run(data_dir: str):
                     reconciled = time.monotonic()
                 time.sleep(.02)
                 continue
-            process_job(jobs, owner, job, get_engine(job["config"]))
+            process_job(jobs, owner, job, get_engine(engine_config(jobs, job)))
     finally:
         jobs.pause(owner)
         lock.release()
+
+
+def engine_config(jobs: Jobs, job: dict) -> str:
+    """ジョブを動かす設定。取り込みは登録したときの設定、確認を当てる作り直しは今の設定（ADR-0025）。
+
+    作り直しを登録したときの設定で動かすと、そのあとで設定を変えて取り込み直した索引に当てられず、何もせずに終わる。
+    """
+    if job.get("kind") != "review":
+        return job["config"]
+    current = Config()
+    if Path(current.data_dir) != jobs.data_dir:
+        current = Config({**current.values, "data_dir": str(jobs.data_dir)})
+    return json.dumps(current.snapshot(), ensure_ascii=False)
 
 
 def reconcile_rebuilds(jobs: Jobs) -> list[dict]:
