@@ -1,0 +1,7 @@
+# wiki と同じ中身で持つファイルは、どの OS で clone しても LF にそろえる（ADR-0025）。
+#
+# rag_pdf_layer.py は、wiki の skills/info-hive/scripts/wiki_pdf_layer.py と同じバイト列であることを、
+# info-hive-dev の契約の試験（tests/contract/test_pdf_layer.py）が確かめる。wiki は LF に固定しているので、
+# Windows で core.autocrlf=true のまま clone しても CRLF にならないよう、このファイルも LF に固定する。
+# ほかのファイルの改行は変えない（今の改行のまま取り出す）。
+scripts/rag_pdf_layer.py text eol=lf
