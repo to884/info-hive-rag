@@ -18,8 +18,9 @@ from contextlib import ExitStack, closing
 from pathlib import Path
 
 import rag_pdf_layer
-from rag_config import (EXTRACT_REVISION, LEGACY_EXTRACT_REVISION, OCR_REVISION, OCR_STORE_REVISION, Config,
-                        render_identity, text_layer_identity, write_json)
+from rag_config import (EXTRACT_REVISION, LEGACY_EXTRACT_REVISION, OCR_CONFIDENCE_REVISION, OCR_REVISION,
+                        OCR_STORE_REVISION, Config, render_identity, text_layer_identity, write_json)
+from rag_review import text_sha256
 # ページの判定は、wiki と同じ中身の rag_pdf_layer に置く（ADR-0025）。rag_pdf.inspect_page の名前も残す
 from rag_pdf_layer import inspect_page  # noqa: F401
 
@@ -44,7 +45,8 @@ def ocr_page(page, config: Config, work: Path, client=None) -> dict:
             bitmap.close()
         if client is not None:
             response = client.recognize(image)
-            return {"text": response["text"], "line_count": response.get("line_count")}
+            return {"text": response["text"], "line_count": response.get("line_count"),
+                    "lines": response.get("lines"), "confidence_revision": response.get("confidence_revision")}
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
                "UV_CACHE_DIR": str(config.uv_cache_dir)}
         runner = Path(__file__).with_name("rag_ocr.py")
@@ -57,7 +59,8 @@ def ocr_page(page, config: Config, work: Path, client=None) -> dict:
         output = folder / "page.txt"
         if not output.is_file():
             raise RuntimeError("NDLOCR-Lite のテキスト出力がありません。")
-        return {"text": output.read_text(encoding="utf-8-sig").strip(), "line_count": None}
+        return {"text": output.read_text(encoding="utf-8-sig").strip(), "line_count": None, "lines": None,
+                "confidence_revision": None}
 
 
 class OcrStore:
@@ -94,8 +97,7 @@ class OcrStore:
     def save(self, number: int, response: dict) -> dict:
         entry = {"page": number, "text": response["text"], "line_count": response.get("line_count"),
                  "render": self.render, "ocr_revision": OCR_REVISION, "store_revision": OCR_STORE_REVISION,
-                 # 文字ごとの確率と行の確信度は、段階 3 で足す。ないものは「確信度が不明」として扱う
-                 "confidence": None, "saved_at": time.time()}
+                 "confidence": confidence_record(response), "saved_at": time.time()}
         write_json(self.path(number), entry)
         return entry
 
@@ -157,6 +159,25 @@ class OcrStore:
             write_json(self.marker, record)
             moved += len(pages)
         return moved
+
+
+def confidence_record(response: dict) -> dict | None:
+    """OCR の応答から、保存する確信度の記録を作る。数え方の版が今と違うか、行の記録がなければ None（確信度が不明）。"""
+    lines = response.get("lines")
+    if response.get("confidence_revision") != OCR_CONFIDENCE_REVISION or lines is None:
+        return None
+    if any(line.get("confidence") is None for line in lines):
+        return None  # 不変条件を満たさない行があった（rag_ocr が確信度を付けなかった）
+    return {"revision": OCR_CONFIDENCE_REVISION, "lines": lines}
+
+
+def confidence_min(entry: dict | None) -> float | None:
+    """OCR の結果の、行の確信度の最小値。確信度が不明なら None。行が 1 つもないページは 1.0（読めなかった行がない）。"""
+    record = (entry or {}).get("confidence")
+    if not record or record.get("revision") != OCR_CONFIDENCE_REVISION:
+        return None
+    values = [line["confidence"] for line in record["lines"]]
+    return min(values) if values else 1.0
 
 
 def _judgement_path(cache: Path, number: int) -> Path:
@@ -222,6 +243,8 @@ def extract_pages(data: bytes, config: Config, cache: Path, progress=None, ocr_c
                 text = entry["text"] if kind in ("text", "vertical") else ""
             page_entry = {"page": number, "extraction_key": key, "text": text, "quality": entry["quality"], "kind": kind,
                           "ocr": needs_ocr, "ocr_empty": needs_ocr and not text.strip(), "ocr_source": ocr_source,
+                          "ocr_sha256": text_sha256(text) if needs_ocr else None,
+                          "confidence_min": confidence_min(found) if needs_ocr else None,
                           "garble": entry["garble"], "needs_check": entry["needs_check"],
                           "text_sha256": entry["text_sha256"]}
             write_json(cache / f"page-{number:06d}.json", page_entry)
@@ -264,7 +287,10 @@ def page_report(data: bytes, config: Config, cache: Path) -> dict:
             "lists": lists, "extraction": text_layer_identity(), "extract_revision": EXTRACT_REVISION,
             "ocr": {"mode": config.ocr_mode, "dpi": config.ocr_dpi, "revision": OCR_REVISION,
                     "render": render_identity(config.ocr_dpi), "store": config.ocr_key},
-            "confidence": None}
+            # 確信度の低いページは、返すときに、そのときの閾値で数える（Jobs.status）。ここには最小値だけを持つ
+            "confidence": {"revision": OCR_CONFIDENCE_REVISION,
+                           "pages": {str(n): {"ocr_sha256": e.get("ocr_sha256"), "confidence_min": e.get("confidence_min")}
+                                     for n, e in sorted(done.items()) if e.get("ocr")}}}
 
 
 def render_page_report(report: dict | None, start: int = 0, limit: int = rag_pdf_layer.LIST_LIMIT) -> dict | None:

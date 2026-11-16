@@ -18,6 +18,7 @@ from filelock import FileLock, Timeout
 
 from rag_config import MODELS, Config, text_layer_identity, write_json
 from rag_pdf import chunks_for, extract_pages, page_report
+from rag_review import Ledger, apply_decisions, confidence_summary, load_summary, page_state, review_lists
 
 
 def file_id(info: os.stat_result) -> tuple[str, str] | None:
@@ -163,6 +164,11 @@ class Engine:
                 generation TEXT PRIMARY KEY, completed INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending', error TEXT);
         """)
+        # rag 0.6.0 で、公開した確認の版を文書の行に持たせた（ADR-0025）。前の版の台帳には列を足す。
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+        if "review_version" not in columns:
+            connection.execute("ALTER TABLE documents ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0")
+            connection.commit()
         with closing(connection), connection:
             yield connection
 
@@ -484,8 +490,23 @@ class Engine:
             affected.append(relative)
         return affected
 
+    @staticmethod
+    def _write_reviewed(folder: Path, doc_id: str, version: int, pages: list[dict]) -> Path:
+        """確認の結果を当てた本文（その wiki の reviewed.md）を書く。確認の版ごとに置く。"""
+        target = folder / "reviewed" / doc_id / str(version) / "document.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Engine._write_markdown(target, pages)
+        return target
+
     def ingest_pdf(self, wiki_root: str, source: str, source_page: str, title: str = "", progress=None,
-                   before_publish=None, expected: tuple | None = None) -> dict:
+                   before_publish=None, expected: tuple | None = None, expected_doc_id: str | None = None,
+                   allow_reset: bool = True) -> dict:
+        """PDF を取り込み、台帳の最新の確認の版を当てた索引を公開する。
+
+        expected_doc_id を渡すと、読んだ PDF の SHA-256 がそれと違えば止まる（確認を当て直すときに、別の版の
+        PDF を取り込まない）。allow_reset が偽なら、方針が変わった索引を空にせず、status が deferred の結果を返す
+        （確認を当て直すジョブは、取り込み直しを起こさない）。
+        """
         wiki = Path(wiki_root).expanduser().resolve()
         folder = self.config.workspace(str(wiki))
         path = self.config.pdf_path(source)
@@ -495,6 +516,9 @@ class Engine:
         with FileLock(str(folder / "write.lock"), timeout=1800), ExitStack() as held:
             # 方針が変わった索引は、抽出が済んでから空にする。それまでは台帳の文書を今の方針のものとみなさない。
             stale = self._stale_policy(folder)
+            if stale and not allow_reset:
+                return {"status": "deferred", "message": "索引の方針が変わったので、取り込み直すまで確認の結果を当てません。"
+                        "取り込み直すと、記録した確認の結果を当てます。"}
             if not stale and not (folder / "policy.json").exists():
                 self._write_policy(folder)
             index_reset = False
@@ -506,7 +530,12 @@ class Engine:
                 if progress:
                     progress("PDF の読み込み", 1, 1)
                 doc_id = hashlib.sha256(data).hexdigest()
-                generation = self.config.generation(doc_id)
+                if expected_doc_id is not None and doc_id != expected_doc_id:
+                    raise ValueError("PDF の中身が、確認した版と違います。新しいジョブで取り込んでください。")
+                # 台帳の最新の確認の版を当てる。版ごとに別の generation にする（ADR-0025）。
+                ledger = Ledger(folder)
+                review_version = ledger.version(doc_id)
+                generation = self.config.generation(doc_id, review_version)
                 # 抽出の結果は wiki のあいだで共有する。使っているあいだは、ほかの取り込みの後始末で消させない。
                 held.enter_context(self._extraction_lock(doc_id))
                 cache = self.config.extraction_dir(doc_id)
@@ -514,6 +543,12 @@ class Engine:
                     self._adopt_legacy_extraction(folder, self._legacy_generations(folder, doc_id, stale), cache)
                     markdown = cache / "document.md"
                     existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+                    previous_generation = existing["generation"] if existing else None
+                    reviewed_markdown = (folder / "reviewed" / doc_id / str(review_version) / "document.md") if review_version else None
+                    if existing and existing["review_version"] != review_version:
+                        # 台帳に、公開した版より新しい確認の結果がある。「同じ PDF と同じ指紋なら使い回す」の分岐を通らず作り直す
+                        title = title.strip() or existing["title"]
+                        existing = None
                     if existing:
                         pages_count, chunks_count = existing["pages"], existing["chunks"]
                         # 索引の行は、記録した generation で入っている（抽出の版を上げる前の式のこともある）。
@@ -531,12 +566,21 @@ class Engine:
                         try:
                             pages = self.extractor(data, self.config, cache, progress)
                             title = title.strip() or path.stem
-                            chunks = chunks_for(pages, title, self.config)
-                            if not chunks:
+                            applied = apply_decisions(pages, ledger.decisions(doc_id, upto=review_version)) if review_version else pages
+                            # 却下したページは索引に入れない（却下を書いた 1 行も入れない）
+                            chunks = chunks_for([page for page in applied if page.get("reviewed") != "rejected"], title, self.config)
+                            if not chunks and previous_generation is None and not review_version:
+                                # 最初の取り込みのときだけ失敗にする。確認の結果で検索できる本文がなくなったときは、行が 0 の版を公開する
                                 raise ValueError("検索できるテキストがありません。取り込みは完了していません。")
                             pages_count, chunks_count = len(pages), len(chunks)
                             if not markdown.exists():
                                 self._write_markdown(markdown, pages)
+                            if review_version:
+                                self._write_reviewed(folder, doc_id, review_version, applied)
+                            write_json(folder / "reviewed" / doc_id / "confidence.json", confidence_summary(pages))
+                            if stale and not chunks:
+                                self._reset_index(folder, connection, stale)
+                                stale, index_reset = None, True
                             # 方針が変わった索引は、最初のバッチの埋め込みが済んでから空にする。モデルの取得や読み込みに
                             # 失敗しても、前の索引を壊さない。設定を戻せば、前の索引をそのまま使える。
                             table = None if stale else self._table(folder, create=True)
@@ -612,11 +656,14 @@ class Engine:
                         if item["sha256"] != doc_id and path.as_posix() in item["paths"]:
                             reviews.update(self._mark_reviews(wiki, connection, item["sha256"], item["source_pages"]))
                     reviews = sorted(reviews)
+                    # 新しい版の行をすべて書いたあとで、公開する generation と確認の版を切りかえる。前の版の途中経過も消す
                     connection.execute("""INSERT OR REPLACE INTO documents
-                        (doc_id,generation,title,pages,chunks,fingerprint,ingested_at)
-                        VALUES (?,?,?,?,?,?,?)""",
+                        (doc_id,generation,title,pages,chunks,fingerprint,ingested_at,review_version)
+                        VALUES (?,?,?,?,?,?,?,?)""",
                                        (doc_id, generation, existing["title"] if existing else title,
-                                        pages_count, chunks_count, self.config.fingerprint, time.time()))
+                                        pages_count, chunks_count, self.config.fingerprint, time.time(), review_version))
+                    if previous_generation and previous_generation != generation:
+                        connection.execute("DELETE FROM jobs WHERE generation=?", (previous_generation,))
                     now = time.time()
                     for place in [location, *aliases]:
                         connection.execute("INSERT OR REPLACE INTO locations VALUES (?,?,?,?,?,?,?)",
@@ -651,6 +698,13 @@ class Engine:
                         self._prune_previous(folder, connection)
                     except Exception as error:
                         cleanup_error = str(error)
+                    if previous_generation and previous_generation != generation:
+                        # 同じ文書の前の版の行を消す。検索は公開した generation だけを返すので、消す前でも混ざらない
+                        try:
+                            self._table(folder).delete(f"doc_id = '{doc_id}' AND generation != '{generation}'")
+                            self._maintain_indexes(folder, self._table(folder))
+                        except Exception as error:
+                            cleanup_error = str(error)
                     for old_id, legacy_generations in removed:
                         try:
                             self._table(folder).delete(f"doc_id = '{old_id}'")
@@ -666,7 +720,8 @@ class Engine:
                             cleanup_error = str(error)
                     return {"status": "unchanged" if skipped else "indexed", "document_id": doc_id,
                             "raw": path.as_posix(), "sha256": doc_id, "pages": pages_count, "chunks": chunks_count,
-                            "extracted_markdown": str(markdown), "source_page": source_page,
+                            "extracted_markdown": str(reviewed_markdown or markdown), "source_page": source_page,
+                            "review": {"ledger_version": ledger.version(doc_id), "published_version": review_version},
                             "review_pages": reviews, "cleanup_error": cleanup_error, "index_reset": index_reset,
                             "indexes":json.loads((folder/'index-state.json').read_text(encoding='utf-8')),
                             # ページの情報と抽出の識別（ADR-0025）。一覧は Jobs.status が 200 個ずつに切って返す
@@ -679,6 +734,64 @@ class Engine:
                     except Exception:
                         pass
                     raise
+
+    def rebuild_reviewed(self, wiki_root: str, doc_id: str, progress=None, before_publish=None) -> dict:
+        """台帳の最新の確認の版を当てて、その wiki の索引を作り直す（ADR-0025 の「作り直しのジョブ」）。
+
+        取り込みと同じ ingest_pdf を通す。抽出と OCR の結果は共有の置き場所のものを使う。公開した版が台帳の版と
+        同じなら何もしない。作り直したあとで台帳の版が新しくなっていれば（作り直しの途中で確認を受け付けた）、
+        続けてもう一度作り直す。方針が変わった索引は空にしない（取り込み直しのときに当てる）。
+        """
+        wiki = Path(wiki_root).expanduser().resolve()
+        folder = self.config.workspace(str(wiki))
+        ledger = Ledger(folder)
+        result = None
+        for _ in range(100):
+            with self._catalog(folder) as connection:
+                row = connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+                if row is None:
+                    raise ValueError("この wiki の索引に、確認した PDF がありません。PDF を取り込み直してください。")
+                if row["review_version"] == ledger.version(doc_id) and not self._stale_policy(folder):
+                    return result or {"status": "unchanged", "document_id": doc_id, "sha256": doc_id,
+                                      "review": {"ledger_version": row["review_version"], "published_version": row["review_version"]}}
+                place = self._location(connection, doc_id)
+                cited = connection.execute("SELECT source_page FROM citations WHERE doc_id=? ORDER BY source_page",
+                                           (doc_id,)).fetchone()
+            if place is None or cited is None:
+                raise ValueError("確認した PDF が、取り込んだ場所にありません（移したか、変えた）。PDF を取り込み直してください。")
+            result = self.ingest_pdf(str(wiki), place, cited[0], row["title"], progress, before_publish,
+                                     expected_doc_id=doc_id, allow_reset=False)
+            if result["status"] == "deferred":
+                return result
+        raise RuntimeError("確認の結果を当てる作り直しが、100 回続けても台帳の版に追いつきませんでした。")
+
+    def _review_marks(self, folder: Path, documents: dict) -> dict:
+        """文書ごとに、公開した版での確認の状態の印を作る関数を返す材料。検索のたびに読む（印は索引に入れない）。"""
+        ledger = Ledger(folder)
+        marks = {}
+        for doc_id, row in documents.items():
+            summary = load_summary(folder, doc_id)
+            if not summary:
+                continue
+            published = ledger.decisions(doc_id, upto=row.get("review_version") or 0)
+            latest = ledger.decisions(doc_id)
+            marks[doc_id] = (summary, published, latest)
+        return marks
+
+    def _mark(self, marks: dict, doc_id: str, page: int) -> dict | None:
+        found = marks.get(doc_id)
+        if not found:
+            return None
+        summary, published, latest = found
+        entry = summary.get(int(page))
+        if entry is None:
+            return None
+        state = page_state(entry, published.get(int(page)), self.config.ocr_confidence_threshold)
+        newer = latest.get(int(page))
+        awaiting = newer is not None and (published.get(int(page)) is None or newer["version"] != published[int(page)]["version"])
+        if not state and not awaiting:
+            return None
+        return {"state": state, "awaiting_publish": awaiting}
 
     def search(self, wiki_root: str, query: str, limit: int = 10) -> dict:
         if not query.strip() or not 1 <= limit <= 50:
@@ -723,6 +836,7 @@ class Engine:
                     if self.config.min_rerank_score is not None:
                         ranked = [key for key in ranked if key in reranked_scores and reranked_scores[key] >= self.config.min_rerank_score]
                 results = []
+                marks = self._review_marks(folder, documents)
                 for key in ranked[:limit]:
                     row = rows[key]
                     found = self._location(connection, row["doc_id"])
@@ -730,7 +844,9 @@ class Engine:
                     results.append({**{k: v for k, v in row.items() if not k.startswith("_")}, "score": scores[key],
                                     "raw": Path(found).as_posix() if found else None, "sha256": row["doc_id"],
                                     "source_pages": sources,
-                                    "rerank_score": reranked_scores.get(key)})
+                                    "rerank_score": reranked_scores.get(key),
+                                    # 確認待ちのページと、確認の結果が反映待ちのページの印（ADR-0025）
+                                    "review": self._mark(marks, row["doc_id"], row["page"])})
                 return {"results": results, "model": self.config.model, "reranker":self.config.reranker,
                         "abstained":not results and self.config.min_rerank_score is not None}
 
@@ -738,13 +854,36 @@ class Engine:
         folder = self.config.workspace(wiki_root)
         if not (folder / "catalog.sqlite").exists():
             return {"documents": 0, "chunks": 0, "jobs": [], "data_dir": str(folder),
-                    "reingest_required": False, "reingest": []}
+                    "reingest_required": False, "reingest": [],
+                    "review": {"pending_pages": 0, "awaiting_publish_pages": 0, "documents": [],
+                               "threshold": self.config.ocr_confidence_threshold}}
         with self._catalog(folder) as connection:
             counts = connection.execute("SELECT COUNT(*),COALESCE(SUM(chunks),0) FROM documents").fetchone()
             jobs = [dict(row) for row in connection.execute("SELECT generation,completed,status,error FROM jobs WHERE status != 'complete'")]
             index_state=folder/'index-state.json'
             # 設定が変わった索引の文書と、空にしたあとまだ取り込み直していない文書（ADR-0014）。
             reingest = self._reingest(folder, connection)
+            documents = {row["doc_id"]: dict(row) for row in connection.execute("SELECT * FROM documents")}
             return {"documents": counts[0], "chunks": counts[1], "jobs": jobs, "data_dir": str(folder),
                     "indexes":json.loads(index_state.read_text(encoding='utf-8')) if index_state.exists() else None,
-                    "reingest_required": bool(reingest), "reingest": reingest}
+                    "reingest_required": bool(reingest), "reingest": reingest,
+                    "review": self._review_status(folder, documents)}
+
+    def _review_status(self, folder: Path, documents: dict) -> dict:
+        """wiki ごとの確認待ちのページの数と、反映待ちのページの数（ADR-0025 の「答えがないとき」）。"""
+        ledger = Ledger(folder)
+        found = []
+        for doc_id, row in documents.items():
+            summary = load_summary(folder, doc_id)
+            if not summary:
+                continue
+            lists = review_lists(summary, ledger.decisions(doc_id), ledger.decisions(doc_id, upto=row["review_version"]),
+                                 self.config.ocr_confidence_threshold)
+            pending = len(lists["review:pending"]) + len(lists["review:stale"])
+            awaiting = len(lists["review:awaiting_publish"])
+            if pending or awaiting:
+                found.append({"sha256": doc_id, "title": row["title"], "pending_pages": pending, "awaiting_publish_pages": awaiting,
+                              "ledger_version": ledger.version(doc_id), "published_version": row["review_version"]})
+        return {"pending_pages": sum(item["pending_pages"] for item in found),
+                "awaiting_publish_pages": sum(item["awaiting_publish_pages"] for item in found), "documents": found,
+                "threshold": self.config.ocr_confidence_threshold}

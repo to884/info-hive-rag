@@ -79,13 +79,18 @@ def serve(threads: int,device: str='cpu'):
                             if not cuda_events: raise RuntimeError(f'{name} の GPU 実行を確認できませんでした。')
                             evidence[name]={'cuda_node_events':cuda_events,'profile':str(path),'providers':model.session.get_providers()}
                     gate=threading.BoundedSemaphore(threads)
-                    models=(detector,*[BoundedRecognizer(model,gate) for model in recognizers])
+                    # 文字ごとの確率も受け取る（ADR-0025）。セッションを作り直したあとで包む
+                    from rag_ocr_confidence import ConfidentRecognizer
+                    models=(detector,*[BoundedRecognizer(ConfidentRecognizer(model),gate) for model in recognizers])
                 image=Path(request['image'])
                 with Image.open(image) as original:
                     pixels=np.array(original.convert('RGB'))
                 result=ocr._run_ocr_on_image_array(*models,image.name,pixels,str(image.parent),save_viz=False)
+            from rag_ocr_confidence import CONFIDENCE_REVISION, line_records
             answer={'ok':True,'text':result['text'].strip(),'line_count':result['line_count'],
-                    'vertical_line_count':result['vertical_line_count'],'pid':os.getpid(),'device':device}
+                    'vertical_line_count':result['vertical_line_count'],'pid':os.getpid(),'device':device,
+                    # 行ごとの本文、文字と終わりの記号の確率、行の確信度、検出器の confidence（ADR-0025）
+                    'lines':line_records(result['json_lines']),'confidence_revision':CONFIDENCE_REVISION}
             if evidence:
                 answer['gpu_execution']=evidence
                 evidence=None

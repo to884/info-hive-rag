@@ -42,6 +42,12 @@ class Jobs:
                     status TEXT NOT NULL DEFAULT 'queued', result TEXT, error TEXT,
                     updated_at REAL NOT NULL);
             """)
+            # rag 0.6.0 で、確認を当てる作り直しのジョブ（kind='review'）を足した（ADR-0025）。前の版の台帳には列を足す。
+            columns = {row[1] for row in db.execute("PRAGMA table_info(ingest_jobs)")}
+            for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'ingest'"), ("doc_id", "TEXT"),
+                                      ("rerun", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE ingest_jobs ADD COLUMN {name} {declaration}")
 
     @contextmanager
     def connect(self):
@@ -79,15 +85,48 @@ class Jobs:
                      json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
-    def status(self, wiki_root: str, job_id: str, page_report_from: int = 0) -> dict:
-        """ジョブの状態を返す。結果の page_report の一覧は、page_report_from の位置から 200 個の範囲を返す。"""
+    def register_rebuild(self, config: Config, wiki_root: str, doc_id: str) -> dict:
+        """確認の結果を当てる作り直しのジョブを登録する。wiki と PDF ごとに 1 つだけ持つ（ADR-0025）。
+
+        取り込みのジョブの重複の除き方（request_key）は使わない。同じ wiki と PDF の作り直しが待っていれば、それを返す
+        （始めるときに台帳の最新の版を読む）。処理中なら rerun の印を付けて返し、終わったときにもう一度待ちに戻す
+        （処理中に受け付けた確認を取りこぼさない）。
+        """
+        wiki = Path(wiki_root).expanduser().resolve()
+        config.workspace(str(wiki))
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT id,status FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
+                AND status IN ('queued','running','paused') ORDER BY created_at DESC LIMIT 1""", (str(wiki), doc_id)).fetchone()
+            if row:
+                identity = row["id"]
+                if row["status"] == "running":
+                    db.execute("UPDATE ingest_jobs SET rerun=1,updated_at=? WHERE id=?", (now, identity))
+            else:
+                identity = uuid.uuid4().hex
+                db.execute("""INSERT INTO ingest_jobs
+                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,kind,doc_id,phase)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (identity, str(wiki), "", "", "", 0, 0, json.dumps(config.snapshot(), ensure_ascii=False), now, now,
+                     "review:" + identity, "review", doc_id, "確認の結果を当てる作り直しを受付"))
+        return self.status(str(wiki), identity)
+
+    def status(self, wiki_root: str, job_id: str, page_report_from: int = 0, threshold: float | None = None) -> dict:
+        """ジョブの状態を返す。結果の page_report の一覧は、page_report_from の位置から 200 個の範囲を返す。
+
+        page_report の確認の状態（確信度の低いページ、確認待ち、反映待ちなど）は、返すときに、その wiki の台帳と
+        公開した版から作る。threshold を省くと、ジョブを登録したときの設定の閾値を使う。
+        """
         wiki = str(Path(wiki_root).expanduser().resolve())
         with self.connect() as db:
             row = db.execute("SELECT * FROM ingest_jobs WHERE id=? AND wiki=?", (job_id, wiki)).fetchone()
         if row is None:
             raise ValueError("この wiki に指定のジョブがありません。")
         result = dict(row)
+        job_config = json.loads(result["config"])
         result.pop("config")
+        result.pop("rerun", None)
         result.pop("owner")
         result.pop("request_key")
         result.pop("dev")
@@ -96,8 +135,54 @@ class Jobs:
         result["result"] = json.loads(result["result"]) if result["result"] else None
         if result["result"] and result["result"].get("page_report"):
             from rag_pdf import render_page_report
-            result["result"]["page_report"] = render_page_report(result["result"]["page_report"], page_report_from)
+            report = result["result"]["page_report"]
+            if threshold is None:
+                threshold = Config(job_config).ocr_confidence_threshold
+            report = self._with_review(report, job_config, wiki, result["result"].get("sha256"), threshold)
+            result["result"]["page_report"] = render_page_report(report, page_report_from)
         return result
+
+    @staticmethod
+    def _with_review(report: dict, job_config: dict, wiki: str, doc_id: str | None, threshold: float) -> dict:
+        """page_report に、確信度の低いページと確認の状態を足す（ADR-0025 の「状態の表示」）。"""
+        from rag_config import OCR_CONFIDENCE_THRESHOLD_CALIBRATED
+        from rag_pdf_layer import page_ranges
+        from rag_review import Ledger, review_lists
+        confidence = report.get("confidence") or {}
+        summary = {int(page): entry for page, entry in confidence.get("pages", {}).items()}
+        published_version, ledger_version, ledger_decisions, published_decisions = 0, 0, {}, {}
+        if doc_id:
+            folder = Config(job_config).workspace(wiki)
+            ledger = Ledger(folder)
+            ledger_version = ledger.version(doc_id)
+            catalog = folder / "catalog.sqlite"
+            if catalog.exists():
+                with closing(sqlite3.connect(catalog, timeout=15)) as db:
+                    columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
+                    row = db.execute("SELECT review_version FROM documents WHERE doc_id=?", (doc_id,)).fetchone() \
+                        if "review_version" in columns else None
+                published_version = int(row[0]) if row else 0
+            ledger_decisions = ledger.decisions(doc_id)
+            published_decisions = ledger.decisions(doc_id, upto=published_version)
+        lists = dict(report["lists"])
+        for name, numbers in review_lists(summary, ledger_decisions, published_decisions, threshold).items():
+            lists[name] = {"count": len(numbers), "ranges": page_ranges(numbers)}
+        return {**report, "lists": lists,
+                "review": {"ledger_version": ledger_version, "published_version": published_version},
+                "confidence": {"revision": confidence.get("revision"), "threshold": threshold,
+                               "threshold_calibrated": OCR_CONFIDENCE_THRESHOLD_CALIBRATED}}
+
+    def completed_document(self, wiki_root: str, job_id: str) -> str:
+        """完了した取り込みのジョブの PDF の SHA-256 を返す。失敗したジョブと作り直しのジョブは受け付けない。"""
+        wiki = str(Path(wiki_root).expanduser().resolve())
+        with self.connect() as db:
+            row = db.execute("SELECT status,result,kind FROM ingest_jobs WHERE id=? AND wiki=?", (job_id, wiki)).fetchone()
+        if row is None:
+            raise ValueError("この wiki に指定のジョブがありません。")
+        result = json.loads(row["result"]) if row["result"] else {}
+        if row["status"] != "completed" or not result.get("sha256"):
+            raise ValueError("完了した取り込みのジョブを指定してください（失敗したジョブには、確かめる OCR の本文がありません）。")
+        return result["sha256"]
 
     def list(self, wiki_root: str) -> list[dict]:
         wiki = str(Path(wiki_root).expanduser().resolve())
@@ -189,6 +274,14 @@ class Jobs:
 
     def finish(self, identity: str, owner: str, *, result=None, error=None):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
+            if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
+                                            "rerun=0,result=?,owner=NULL,updated_at=? WHERE id=? AND owner=? AND status='running' "
+                                            "AND kind='review' AND rerun=1",
+                                            (json.dumps(result, ensure_ascii=False) if result is not None else None,
+                                             time.time(), identity, owner)).rowcount:
+                return
             db.execute("""UPDATE ingest_jobs SET status=?,phase=?,result=?,error=?,owner=NULL,updated_at=?
                 WHERE id=? AND owner=? AND status='running'""",
                 ("failed" if error else "completed", "失敗" if error else "完了",

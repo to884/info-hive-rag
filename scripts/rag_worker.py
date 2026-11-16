@@ -155,14 +155,20 @@ def run(data_dir: str):
 
 def process_job(jobs: Jobs, owner: str, job: dict, engine) -> None:
     """取り出したジョブを 1 件処理し、結果か失敗を台帳に書く。"""
+    progress = lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total)  # noqa: E731
+    publish = lambda: jobs.begin_publication(job["id"], owner)  # noqa: E731
     try:
+        if job.get("kind") == "review":
+            # 確認の結果を当てる作り直し（ADR-0025）。PDF は索引の台帳に記録した場所から読む
+            result = engine.rebuild_reviewed(job["wiki"], job["doc_id"], progress=progress, before_publish=publish)
+            jobs.finish(job["id"], owner, result=result)
+            return
         source = Path(job["source"])
         stat = source.stat()
         if (stat.st_size, stat.st_mtime_ns) != (job["size"], job["mtime_ns"]):
             raise ValueError("登録後に PDF が変わりました。新しいジョブで取り込んでください。")
         result = engine.ingest_pdf(job["wiki"], job["source"], job["source_page"], job["title"],
-            progress=lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total),
-            before_publish=lambda: jobs.begin_publication(job["id"], owner),
+            progress=progress, before_publish=publish,
             expected=(job["dev"], job["ino"], job["size"], job["mtime_ns"]))
         jobs.finish(job["id"], owner, result=result)
     except JobCancelled:

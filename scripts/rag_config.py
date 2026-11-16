@@ -33,6 +33,13 @@ EXTRACT_REVISION = rag_pdf_layer.EXTRACT_REVISION
 LEGACY_EXTRACT_REVISION = "extract-v1"
 # OCR の結果を別に保存する形の版（ADR-0025）。保存の形を変えたら上げる。
 OCR_STORE_REVISION = "ocr-store-v1"
+# OCR の確信度の数え方の版（ADR-0025）。rag_ocr.py の数え方を変えたら上げる。版が違う結果は「確信度が不明」になる。
+# OCR の鍵には入れない（数え方を変えても OCR はやり直さない）。
+OCR_CONFIDENCE_REVISION = "confidence-v1"
+# 行の確信度の閾値の既定値。ADR-0025 の承認の条件 5 で校正するまでの仮の値で、page_report に「未校正」と出す。
+# 索引の方針の指紋には入れない（閾値を変えても、取り込み直しは要らない）。
+DEFAULT_OCR_CONFIDENCE_THRESHOLD = 0.8
+OCR_CONFIDENCE_THRESHOLD_CALIBRATED = False
 
 
 def text_layer_identity() -> dict:
@@ -124,6 +131,9 @@ class Config:
         self.threads = int(values.get("cpu_threads", max(1, min(os.cpu_count() or 1, 8))))
         self.ocr_mode = values.get("ocr_mode", "auto")
         self.ocr_dpi = int(values.get("ocr_dpi", 150))
+        self.ocr_confidence_threshold = float(values.get("ocr_confidence_threshold", DEFAULT_OCR_CONFIDENCE_THRESHOLD))
+        if not (math.isfinite(self.ocr_confidence_threshold) and 0 < self.ocr_confidence_threshold <= 1):
+            raise ValueError("ocr_confidence_threshold は 0 より大きく 1 以下にしてください。")
         self.reranker = values.get("reranker", "off")
         self.rerank_limit = int(values.get("rerank_limit", 8))
         threshold = values.get("min_rerank_score")
@@ -218,8 +228,14 @@ class Config:
         """0.4.0 が wiki ごとに置いた抽出の結果（extract-v1）を、今の抽出の版の結果として使えるなら True。"""
         return EXTRACT_REVISION == LEGACY_EXTRACT_REVISION
 
-    def generation(self, doc_id: str) -> str:
-        """索引の行と埋め込みの途中経過の鍵。指紋（抽出の版を含む）が変われば変わるので、前の方針の途中経過を使い回さない。"""
+    def generation(self, doc_id: str, review_version: int = 0) -> str:
+        """索引の行と埋め込みの途中経過の鍵。指紋（抽出の版を含む）が変われば変わるので、前の方針の途中経過を使い回さない。
+
+        確認の結果を当てた版（review_version）も入れる（ADR-0025）。確認の版ごとに別の行と途中経過になり、前の版の
+        途中経過を使い回さない。版が 0（確認の結果がない）のときは、今までと同じ値にする。
+        """
+        if review_version:
+            return hashlib.sha256(f"{doc_id}{self.fingerprint}:review-{int(review_version)}".encode("ascii")).hexdigest()
         return hashlib.sha256((doc_id + self.fingerprint).encode("ascii")).hexdigest()
 
     @staticmethod

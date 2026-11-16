@@ -146,10 +146,35 @@ async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0, page_re
         raise ValueError("page_report_from は 0 以上にしてください。")
     deadline = time.monotonic() + wait_seconds
     while True:
-        result = jobs().status(wiki_root, job_id, page_report_from)
+        result = jobs().status(wiki_root, job_id, page_report_from, configuration().ocr_confidence_threshold)
         if result["status"] in {"completed", "failed", "cancelled"} or time.monotonic() >= deadline:
             return result
         await asyncio.sleep(.1)
+
+
+@server.tool()
+def ocr_page_detail(wiki_root: str, job_id: str, page: int) -> dict:
+    """完了した取り込みのジョブの、OCR したページの詳しいことを返す（ADR-0025）。OCR の本文、その SHA-256、
+    確信度の低い行（行の番号、本文、確信度、ページの中の位置）、今の確認の結果と履歴、台帳の確認の版、公開した確認の版。
+    OCR の本文は共有の抽出の結果から返すので、直したり却下したりしたあとでも、元の OCR の本文が分かる。"""
+    from rag_review import page_detail
+    doc_id = jobs().completed_document(wiki_root, job_id)
+    return page_detail(configuration(), wiki_root, doc_id, page)
+
+
+@server.tool()
+def decide_ocr_pages(wiki_root: str, job_id: str, base_version: int, decisions: list[dict]) -> dict:
+    """OCR の確信度の低いページの確認の結果を受け付ける（ADR-0025）。decisions はページごとに
+    {"page", "action": accept / fix / reject, "text"（fix のとき、直した本文）, "decided_by": user / agent_draft_approved,
+    "ocr_sha256"（ocr_page_detail で確かめた OCR の本文の SHA-256）}。base_version は、もとにした台帳の確認の版
+    （ocr_page_detail の ledger_version）。台帳の版か SHA-256 が今と違えば受け付けない。受け付けたら台帳の版を上げ、
+    その wiki の本文と索引を作り直すジョブを登録して返す。反映は rebuild_job を job_status で確かめる。"""
+    from rag_review import decide
+    with _lock:
+        doc_id = jobs().completed_document(wiki_root, job_id)
+        version = decide(configuration(), wiki_root, doc_id, base_version, decisions)
+        rebuild = jobs().register_rebuild(configuration(), wiki_root, doc_id)
+    return {"ledger_version": version, "rebuild_job": rebuild}
 
 
 @server.tool()
@@ -187,7 +212,8 @@ def status(wiki_root: str) -> dict:
     """取り込み済みの件数と、中断・失敗した処理を確認する。settings に今の OCR の設定（ocr_mode、ocr_dpi）を返す。"""
     result = engine().status(wiki_root)
     current = configuration()
-    result["settings"] = {"ocr_mode": current.ocr_mode, "ocr_dpi": current.ocr_dpi}
+    result["settings"] = {"ocr_mode": current.ocr_mode, "ocr_dpi": current.ocr_dpi,
+                          "ocr_confidence_threshold": current.ocr_confidence_threshold}
     result["index_jobs"] = result.pop("jobs")
     result["jobs"] = jobs().list(wiki_root)
     legacy = jobs().legacy_data()
