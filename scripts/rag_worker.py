@@ -175,9 +175,12 @@ def reconcile_rebuilds(jobs: Jobs) -> list[dict]:
         config = Config()
         if Path(config.data_dir) != jobs.data_dir:
             config = Config({**config.values, "data_dir": str(jobs.data_dir)})
-        for wiki, doc_id in pending_rebuilds(jobs.data_dir):
+        from rag_review import Ledger
+        for wiki, doc_id in pending_rebuilds(jobs.data_dir, config.fingerprint):
             try:
                 found.append(jobs.register_rebuild(config, wiki, doc_id))
+                ledger = Ledger(config.workspace(wiki))
+                ledger.mark_registered(doc_id, ledger.version(doc_id))
             except ValueError:
                 continue  # wiki を消したなど
         return found

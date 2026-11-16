@@ -174,6 +174,9 @@ def decide_ocr_pages(wiki_root: str, job_id: str, base_version: int, decisions: 
         doc_id = jobs().completed_document(wiki_root, job_id)
         version = decide(configuration(), wiki_root, doc_id, base_version, decisions)
         rebuild = jobs().register_rebuild(configuration(), wiki_root, doc_id)
+        # この版の作り直しを登録したことを台帳に残す。ここまでに止まっても、ワーカーが状態から登録し直す
+        from rag_review import Ledger
+        Ledger(configuration().workspace(wiki_root)).mark_registered(doc_id, version)
     return {"ledger_version": version, "rebuild_job": rebuild}
 
 

@@ -51,6 +51,7 @@ class Ledger:
                     action TEXT NOT NULL, text TEXT, decided_by TEXT NOT NULL, ocr_sha256 TEXT NOT NULL,
                     decided_at REAL NOT NULL, PRIMARY KEY (doc_id, version, page));
                 CREATE TABLE IF NOT EXISTS review_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS review_registered (doc_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
             """)
             with db:
                 yield db
@@ -80,6 +81,20 @@ class Ledger:
             return {}
         with self.connect() as db:
             return {row[0]: int(row[1]) for row in db.execute("SELECT doc_id,version FROM review_versions")}
+
+    def mark_registered(self, doc_id: str, version: int) -> None:
+        """台帳の版 version までの確認について、作り直しのジョブを登録したことを記録する。"""
+        with self.connect() as db:
+            db.execute("""INSERT INTO review_registered VALUES (?,?) ON CONFLICT(doc_id)
+                DO UPDATE SET version=MAX(version, excluded.version)""", (doc_id, int(version)))
+
+    def unregistered(self) -> dict[str, int]:
+        """台帳の版が、作り直しのジョブを登録した版より新しい文書（登録する前に止まった確認がある文書）。"""
+        if not self.path.exists():
+            return {}
+        with self.connect() as db:
+            return {row[0]: int(row[1]) for row in db.execute("""SELECT v.doc_id, v.version FROM review_versions v
+                LEFT JOIN review_registered r ON r.doc_id = v.doc_id WHERE r.version IS NULL OR r.version < v.version""")}
 
     def wiki(self) -> str | None:
         """確認を受け付けた wiki のパス（作り直しのジョブを登録し直すときに使う）。"""
@@ -215,10 +230,11 @@ def published_folder(folder: Path, doc_id: str, generation: str) -> Path:
     return Path(folder) / "reviewed" / doc_id / generation
 
 
-def load_summary(folder: Path, doc_id: str, generation: str) -> dict[int, dict]:
+def load_summary(folder: Path, doc_id: str, generation: str) -> dict[int, dict] | None:
+    """公開する版の確信度の要約。ファイルがなければ None（空の要約は、OCR したページがない正しい結果）。"""
     path = published_folder(folder, doc_id, generation) / "confidence.json"
     if not path.exists():
-        return {}
+        return None
     data = json.loads(path.read_text(encoding="utf-8"))
     return {int(page): entry for page, entry in data["pages"].items()}
 
@@ -318,10 +334,14 @@ def published_documents(folder: Path) -> dict[str, dict]:
                 for row in db.execute(f"SELECT doc_id,generation,{version} FROM documents")}
 
 
-def pending_rebuilds(data_dir: Path) -> list[tuple[str, str]]:
-    """台帳の版が、公開した確認の版より新しい（wiki, 文書）の組。作り直しのジョブを状態から登録し直すために使う。
+def pending_rebuilds(data_dir: Path, fingerprint: str | None = None) -> list[tuple[str, str]]:
+    """確認を台帳に書いたのに、その版の作り直しのジョブを登録していない（wiki, 文書）の組。
 
     確認を台帳に書いたあと、作り直しのジョブを登録する前に止まっても、ここで見つかる（2 つの DB にまたがる取りこぼしを防ぐ）。
+    一度登録した版は、ジョブを取り消したり、ジョブが失敗したりしても、ここには出さない（利用者が決めたことを覆さない。
+    失敗したジョブは、明示的な再試行で動かす）。
+    索引の方針（policy.json の指紋）が fingerprint と違う wiki は外す。作り直しは方針の変わった索引に当てない
+    （deferred で終わる）ので、登録し直すと、同じ作り直しを繰り返すことになる。取り込み直したときに当てる。
     """
     found = []
     for folder in sorted((Path(data_dir) / "wikis-v2").glob("*")):
@@ -329,8 +349,11 @@ def pending_rebuilds(data_dir: Path) -> list[tuple[str, str]]:
         wiki = ledger.wiki()
         if not wiki:
             continue
+        policy = folder / "policy.json"
+        if fingerprint and policy.exists() and json.loads(policy.read_text(encoding="utf-8")).get("fingerprint") != fingerprint:
+            continue
         published = published_documents(folder)
-        for doc_id, version in ledger.versions().items():
+        for doc_id, version in ledger.unregistered().items():
             if doc_id in published and version > published[doc_id]["review_version"]:
                 found.append((wiki, doc_id))
     return found

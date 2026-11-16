@@ -138,7 +138,8 @@ class Jobs:
             report = result["result"]["page_report"]
             if threshold is None:
                 threshold = Config(job_config).ocr_confidence_threshold
-            report = self._with_review(report, job_config, wiki, result["result"].get("sha256"), threshold)
+            report = self._with_review(report, job_config, wiki, result["result"].get("sha256") or result.get("doc_id"),
+                                       threshold)
             result["result"]["page_report"] = render_page_report(report, page_report_from)
         return result
 
@@ -161,7 +162,8 @@ class Jobs:
             published = published_documents(folder).get(doc_id)
             if published:
                 published_version = published["review_version"]
-                summary = load_summary(folder, doc_id, published["generation"]) or summary
+                loaded = load_summary(folder, doc_id, published["generation"])
+                summary = loaded if loaded is not None else summary  # 空の要約も、公開している版の正しい結果
                 ledger_decisions = ledger.decisions(doc_id)
                 published_decisions = ledger.decisions(doc_id, upto=published_version)
         lists = dict(report["lists"])
@@ -310,12 +312,16 @@ class Jobs:
     def retry(self, wiki_root: str, job_id: str) -> dict:
         current = self.status(wiki_root, job_id)
         if current.get("kind") == "review":
-            # 作り直しのジョブは、wiki と PDF ごとに 1 つだけ持つ。待っているか処理中のものがあれば、それを返す
+            # 作り直しのジョブは、wiki と PDF ごとに 1 つだけ持つ。待っているか処理中のものがあれば、それを返す。
+            # 確かめることと待ちに戻すことを、1 つのトランザクションで行う（別の接続が、あいだに登録できないように）
             with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
                 row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND id!=?
                     AND status IN ('queued','running','paused') LIMIT 1""", (current["wiki"], current["doc_id"], job_id)).fetchone()
-            if row:
-                return self.status(current["wiki"], row[0])
+                if row is None:
+                    db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,updated_at=? "
+                               "WHERE id=? AND status IN ('failed','cancelled')", (time.time(), job_id))
+            return self.status(current["wiki"], row[0] if row else job_id)
         with self.connect() as db:
             db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,updated_at=? WHERE id=? AND status IN ('failed','cancelled')",
                        (time.time(), job_id))

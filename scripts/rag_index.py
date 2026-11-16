@@ -170,6 +170,11 @@ class Engine:
         if "review_version" not in columns:
             connection.execute("ALTER TABLE documents ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0")
             connection.commit()
+        # 利用者が渡したままの PDF のパス（ネットワークドライブのドライブ文字のパス）を、場所の行に残す（ADR-0025）。
+        # 解決したパスは UNC になることがあり、確認を当て直すときに、登録の確かめで拒まれるため
+        if "source" not in {row[1] for row in connection.execute("PRAGMA table_info(locations)")}:
+            connection.execute("ALTER TABLE locations ADD COLUMN source TEXT")
+            connection.commit()
         # 途中経過（jobs）に文書の列を足した。文書のすべての確認の版の途中経過を、文書で消せるようにする
         if "doc_id" not in {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}:
             connection.execute("ALTER TABLE jobs ADD COLUMN doc_id TEXT")
@@ -683,9 +688,11 @@ class Engine:
                         connection.execute("DELETE FROM jobs WHERE generation=?", (previous_generation,))
                     now = time.time()
                     for place in [location, *aliases]:
-                        connection.execute("INSERT OR REPLACE INTO locations VALUES (?,?,?,?,?,?,?)",
+                        connection.execute("""INSERT OR REPLACE INTO locations (path,doc_id,size,mtime_ns,confirmed_at,dev,ino,source)
+                            VALUES (?,?,?,?,?,?,?,?)""",
                                            (place, doc_id, stat_after.st_size, stat_after.st_mtime_ns,
-                                            now if place == location else now - 1e-6, *(same_file or (None, None))))
+                                            now if place == location else now - 1e-6, *(same_file or (None, None)),
+                                            self.config.pdf_source(source) if place == location else None))
                     connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, source_page))
                     # 索引を空にする前に、この文書を出典にしていたページも戻す。版が変わったときの要再確認の印に使う。
                     restored = self._previous_documents(folder).get(doc_id)
@@ -781,6 +788,10 @@ class Engine:
                 if row is None:
                     raise ValueError("この wiki の索引に、確認した PDF がありません。PDF を取り込み直してください。")
                 place = self._location(connection, doc_id)
+                if place is not None:
+                    # 利用者が渡したままのパスがあれば、それを使う（ネットワークドライブの PDF の解決したパスは UNC になる）
+                    given = connection.execute("SELECT source FROM locations WHERE path=?", (place,)).fetchone()
+                    place = given[0] if given and given[0] else place
                 cited = connection.execute("SELECT source_page FROM citations WHERE doc_id=? ORDER BY source_page",
                                            (doc_id,)).fetchone()
             if place is None or cited is None:
