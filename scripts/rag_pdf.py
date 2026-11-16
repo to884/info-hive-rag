@@ -289,7 +289,8 @@ def page_report(data: bytes, config: Config, cache: Path) -> dict:
                     "render": render_identity(config.ocr_dpi), "store": config.ocr_key},
             # 確信度の低いページは、返すときに、そのときの閾値で数える（Jobs.status）。ここには最小値だけを持つ
             "confidence": {"revision": OCR_CONFIDENCE_REVISION,
-                           "pages": {str(n): {"ocr_sha256": e.get("ocr_sha256"), "confidence_min": e.get("confidence_min")}
+                           "pages": {str(n): {"ocr": True, "ocr_sha256": e.get("ocr_sha256"),
+                                              "confidence_min": e.get("confidence_min")}
                                      for n, e in sorted(done.items()) if e.get("ocr")}}}
 
 
