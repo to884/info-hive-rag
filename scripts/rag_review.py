@@ -1,4 +1,4 @@
-"""OCR の確信度の低いページの確認（ADR-0025 の「OCR の確信度とページの確認」）。
+"""OCR の印の付いた行があるページの確認（ADR-0025 の「OCR の行の印とページの確認」）。
 
 確認の結果は wiki ごとに持つ。置き場所は 3 つに分ける。
 
@@ -172,29 +172,33 @@ class Ledger:
         return version
 
 
-def is_low(entry: dict, threshold: float) -> bool | None:
-    """OCR したページの確信度が低いか。確信度が不明なら None を返す（低いとも高いとも扱わない）。
+def is_flagged(entry: dict, threshold: float) -> bool | None:
+    """OCR したページに、印の付いた行があるか（ADR-0025 の「行の印」）。印が不明なら None を返す。
 
-    数え方の版（confidence_revision）が今と違う記録も、確信度が不明として扱う。
+    印は、行の確信度が閾値より低い（"low"）か、OCR したときに決まった印（"blur"、"alt"）があること。
+    確信度の数え方の版（confidence_revision）か印の決め方の版（flag_revision）が今と違う記録は、印が不明として
+    扱う（確認が要るとも要らないとも扱わない）。
     """
     from rag_config import OCR_CONFIDENCE_REVISION
-    if entry.get("confidence_revision") != OCR_CONFIDENCE_REVISION:
+    from rag_ocr_flags import OCR_FLAG_REVISION
+    if entry.get("confidence_revision") != OCR_CONFIDENCE_REVISION or entry.get("flag_revision") != OCR_FLAG_REVISION:
         return None
     minimum = entry.get("confidence_min")
-    if minimum is None:
+    flagged = entry.get("flagged")
+    if minimum is None or flagged is None:
         return None
-    return minimum < threshold
+    return bool(flagged) or minimum < threshold
 
 
 def page_state(entry: dict, decision: dict | None, threshold: float) -> str | None:
-    """OCR したページの確認の状態。OCR していないページと、確信度が高いか不明で決めていないページは None。"""
+    """OCR したページの確認の状態。OCR していないページと、印がないか不明で決めていないページは None。"""
     if not entry.get("ocr"):
         return None
     if decision is not None:
         if decision["ocr_sha256"] != entry.get("ocr_sha256"):
             return "stale"  # OCR をやり直して本文が変わった。決めた結果は当てず、確認待ちに戻す
         return {"accept": "accepted", "fix": "fixed", "reject": "rejected"}[decision["action"]]
-    return "pending" if is_low(entry, threshold) else None
+    return "pending" if is_flagged(entry, threshold) else None
 
 
 def apply_decisions(pages: list[dict], decisions: dict[int, dict]) -> list[dict]:
@@ -221,7 +225,8 @@ def confidence_summary(pages: list[dict]) -> dict:
     """wiki の作業領域に置く、公開する版のページの確信度の要約（検索の印、status、page_report の確認の状態で使う）。"""
     return {"pages": {str(page["page"]): {"ocr": bool(page.get("ocr")), "ocr_sha256": page.get("ocr_sha256"),
                                           "confidence_min": page.get("confidence_min"),
-                                          "confidence_revision": page.get("confidence_revision")}
+                                          "confidence_revision": page.get("confidence_revision"),
+                                          "flagged": page.get("flagged"), "flag_revision": page.get("flag_revision")}
                       for page in pages if page.get("ocr")}}
 
 
@@ -245,14 +250,14 @@ def review_lists(summary: dict[int, dict], ledger_decisions: dict[int, dict], pu
     """確認の状態ごとのページ。公開した版の状態から作り、台帳の版が新しいページは awaiting_publish にも入れる。"""
     lists: dict[str, list[int]] = {f"review:{state}": [] for state in STATES}
     lists["review:awaiting_publish"] = []
-    lists["ocr_low_confidence"] = []
-    lists["ocr_unknown_confidence"] = []
+    lists["ocr_flagged"] = []
+    lists["ocr_unknown_flags"] = []
     for page, entry in sorted(summary.items()):
-        low = is_low(entry, threshold)
-        if low:
-            lists["ocr_low_confidence"].append(page)
-        elif low is None:
-            lists["ocr_unknown_confidence"].append(page)
+        flagged = is_flagged(entry, threshold)
+        if flagged:
+            lists["ocr_flagged"].append(page)
+        elif flagged is None:
+            lists["ocr_unknown_flags"].append(page)
         state = page_state(entry, published_decisions.get(page), threshold)
         if state:
             lists[f"review:{state}"].append(page)
@@ -298,18 +303,23 @@ def page_detail(config, wiki: str, doc_id: str, page: int) -> dict:
     entry = ocr_pages(config, doc_id).get(int(page))
     if entry is None:
         raise ValueError(f"{page} ページ目は、この PDF の OCR したページではありません。")
+    from rag_ocr_flags import OCR_FLAG_REVISION, reasons_for
     stored = OcrStore(config, doc_id).load(int(page))
     record = (stored or {}).get("confidence")
     threshold = config.ocr_confidence_threshold
     lines = None
-    if record:
-        lines = [{"line": number, "text": line["text"], "confidence": line["confidence"], "box": line.get("box"),
-                  "vertical": line.get("vertical")}
-                 for number, line in enumerate(record["lines"], start=1) if line["confidence"] < threshold]
+    if record and record.get("flag_revision") == OCR_FLAG_REVISION:
+        lines = []
+        for number, line in enumerate(record["lines"], start=1):
+            reasons = reasons_for(line, threshold)
+            if reasons:
+                lines.append({"line": number, "text": line["text"], "reasons": reasons,
+                              "blur_text": line.get("blur_text"), "alt_text": line.get("alt_text"),
+                              "confidence": line["confidence"], "box": line.get("box"), "vertical": line.get("vertical")})
     snapshot = Ledger(folder).snapshot(doc_id, int(page), published)
     return {"page": int(page), "ocr_text": entry["text"], "ocr_sha256": entry["ocr_sha256"],
-            "confidence_min": entry.get("confidence_min"), "confidence_known": is_low(entry, threshold) is not None,
-            "threshold": threshold, "low_lines": lines,
+            "confidence_min": entry.get("confidence_min"), "flags_known": is_flagged(entry, threshold) is not None,
+            "threshold": threshold, "flagged_lines": lines,
             "state": page_state(entry, snapshot["published"], threshold),
             "decision": snapshot["latest"], "history": snapshot["history"],
             "ledger_version": snapshot["version"], "published_version": published}

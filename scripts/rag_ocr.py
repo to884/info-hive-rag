@@ -41,6 +41,8 @@ def serve(threads: int,device: str='cpu'):
         rec_classes=str(package/'config/NDLmoji.yaml'),enable_tcy=False)
     models=None
     evidence=None
+    blurred={}
+    blur_wanted=[False]
     class BoundedRecognizer:
         def __init__(self,model,gate): self.model,self.gate=model,gate
         def read(self,image):
@@ -80,17 +82,35 @@ def serve(threads: int,device: str='cpu'):
                             evidence[name]={'cuda_node_events':cuda_events,'profile':str(path),'providers':model.session.get_providers()}
                     gate=threading.BoundedSemaphore(threads)
                     # 文字ごとの確率も受け取る（ADR-0025）。セッションを作り直したあとで包む
-                    from rag_ocr_confidence import ConfidentRecognizer
+                    from rag_ocr_confidence import ConfidentRecognizer, blur_text
                     models=(detector,*[BoundedRecognizer(ConfidentRecognizer(model),gate) for model in recognizers])
+                    # 行の印の「ぼかした読み」（ADR-0025）。process_cascade のあとに、行の画像ごとに読む。
+                    # NDLOCR-Lite のファイルは変えず、モジュールの関数を包む
+                    original_cascade=ocr.process_cascade
+                    def cascade(alllineobj,recognizer30,recognizer50,recognizer100,is_cascade=True):
+                        results=original_cascade(alllineobj,recognizer30,recognizer50,recognizer100,is_cascade=is_cascade)
+                        blurred.clear()
+                        if blur_wanted[0]:
+                            for lineobj in alllineobj:
+                                blurred[lineobj.idx]=blur_text(recognizer100,lineobj.npimg)
+                        return results
+                    ocr.process_cascade=cascade
                 image=Path(request['image'])
+                blur_wanted[0]=bool(request.get('blur'))
                 with Image.open(image) as original:
                     pixels=np.array(original.convert('RGB'))
                 result=ocr._run_ocr_on_image_array(*models,image.name,pixels,str(image.parent),save_viz=False)
-            from rag_ocr_confidence import CONFIDENCE_REVISION, line_records
+            from rag_ocr_confidence import BLUR_REVISION, CONFIDENCE_REVISION, line_records
+            records=line_records(result['json_lines'])
+            if blur_wanted[0]:
+                for index,record in enumerate(records):
+                    record['blur_text']=blurred.get(index)
             answer={'ok':True,'text':result['text'].strip(),'line_count':result['line_count'],
                     'vertical_line_count':result['vertical_line_count'],'pid':os.getpid(),'device':device,
                     # 行ごとの本文、文字と終わりの記号の確率、行の確信度、検出器の confidence（ADR-0025）
-                    'lines':line_records(result['json_lines']),'confidence_revision':CONFIDENCE_REVISION}
+                    'lines':records,'confidence_revision':CONFIDENCE_REVISION}
+            if blur_wanted[0]:
+                answer['blur_revision']=BLUR_REVISION
             if evidence:
                 answer['gpu_execution']=evidence
                 evidence=None

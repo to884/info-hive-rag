@@ -135,7 +135,7 @@ class Jobs:
     def status(self, wiki_root: str, job_id: str, page_report_from: int = 0, threshold: float | None = None) -> dict:
         """ジョブの状態を返す。結果の page_report の一覧は、page_report_from の位置から 200 個の範囲を返す。
 
-        page_report の確認の状態（確信度の低いページ、確認待ち、反映待ちなど）は、返すときに、その wiki の台帳と
+        page_report の確認の状態（印の付いた行があるページ、確認待ち、反映待ちなど）は、返すときに、その wiki の台帳と
         公開した版から作る。threshold を省くと、ジョブを登録したときの設定の閾値を使う。
         """
         wiki = str(Path(wiki_root).expanduser().resolve())
@@ -173,8 +173,9 @@ class Jobs:
 
     @staticmethod
     def _with_review(report: dict, job_config: dict, wiki: str, doc_id: str | None, threshold: float) -> dict:
-        """page_report に、確信度の低いページと確認の状態を足す（ADR-0025 の「状態の表示」）。"""
+        """page_report に、印の付いた行があるページと確認の状態を足す（ADR-0025 の「状態の表示」）。"""
         from rag_config import OCR_CONFIDENCE_THRESHOLD_CALIBRATED
+        from rag_ocr_flags import OCR_FLAG_REVISION
         from rag_pdf_layer import page_ranges
         from rag_review import Ledger, load_summary, published_documents, published_folder, review_lists
         confidence = report.get("confidence") or {}
@@ -215,7 +216,9 @@ class Jobs:
                            # 確認を当てた本文（公開している版）。確認の結果がなければ None（ジョブの extracted_markdown を読む）
                            "extracted_markdown": markdown},
                 "confidence": {"revision": confidence.get("revision"), "threshold": threshold,
-                               "threshold_calibrated": OCR_CONFIDENCE_THRESHOLD_CALIBRATED}}
+                               "threshold_calibrated": OCR_CONFIDENCE_THRESHOLD_CALIBRATED,
+                               # 行の印の決め方の版（ADR-0025 の「行の印」）。確認が要るページは、印の付いた行で決まる
+                               "flag_revision": OCR_FLAG_REVISION}}
 
     def completed_document(self, wiki_root: str, job_id: str) -> str:
         """完了した取り込みのジョブの PDF の SHA-256 を返す。失敗したジョブと作り直しのジョブは受け付けない。"""

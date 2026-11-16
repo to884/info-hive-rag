@@ -32,13 +32,15 @@ EXTRACT_REVISION = rag_pdf_layer.EXTRACT_REVISION
 # 0.4.0 の抽出は extract-v1 にあたる。0.4.0 が wiki ごとに置いた結果を移すのは、この版のときだけ。
 LEGACY_EXTRACT_REVISION = "extract-v1"
 # OCR の結果を別に保存する形の版（ADR-0025）。保存の形を変えたら上げる。
-OCR_STORE_REVISION = "ocr-store-v1"
+# v2 から、別の解像度の読みと、行の印（rag_ocr_flags）を一緒に保存する。
+OCR_STORE_REVISION = "ocr-store-v2"
 # OCR の確信度の数え方の版（ADR-0025）。rag_ocr.py の数え方を変えたら上げる。版が違う結果は「確信度が不明」になる。
 # OCR の鍵には入れない（数え方を変えても OCR はやり直さない）。
 OCR_CONFIDENCE_REVISION = "confidence-v1"
-# 行の確信度の閾値の既定値。ADR-0025 の承認の条件 5 で校正するまでの仮の値で、page_report に「未校正」と出す。
+# 行の印の 1（確信度が低い）の閾値の既定値（ADR-0025 の「行の印」）。承認の条件 5 の選ぶ資料で選んだ値で、
+# 確かめる資料で確かめるまでは、page_report に「未校正」と出す。
 # 索引の方針の指紋には入れない（閾値を変えても、取り込み直しは要らない）。
-DEFAULT_OCR_CONFIDENCE_THRESHOLD = 0.8
+DEFAULT_OCR_CONFIDENCE_THRESHOLD = 0.3
 OCR_CONFIDENCE_THRESHOLD_CALIBRATED = False
 
 
@@ -208,8 +210,13 @@ class Config:
 
     @property
     def ocr_key(self) -> str:
-        """OCR の結果の鍵。描画の識別（pypdfium2 の版と dpi）と OCR の版で決まる。ocr_mode と文字の層は入れない。"""
-        return f"{OCR_STORE_REVISION}-{OCR_REVISION[:12]}-{short_hash(render_identity(self.ocr_dpi), 12)}"
+        """OCR の結果の鍵。描画の識別（pypdfium2 の版と dpi、読み直しの dpi）と OCR の版と印の版で決まる。
+        ocr_mode と文字の層は入れない。"""
+        from rag_ocr_flags import OCR_FLAG_REVISION, alt_dpi
+
+        render = {"render": render_identity(self.ocr_dpi), "alt_render": render_identity(alt_dpi(self.ocr_dpi)),
+                  "flags": OCR_FLAG_REVISION}
+        return f"{OCR_STORE_REVISION}-{OCR_REVISION[:12]}-{short_hash(render, 12)}"
 
     def ocr_dir(self, doc_id: str) -> Path:
         """OCR の結果の置き場所。抽出の結果と同じく文書ごとに置き、同じロックと後始末に乗せる。"""

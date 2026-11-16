@@ -20,6 +20,7 @@ from pathlib import Path
 import rag_pdf_layer
 from rag_config import (EXTRACT_REVISION, LEGACY_EXTRACT_REVISION, OCR_CONFIDENCE_REVISION, OCR_REVISION,
                         OCR_STORE_REVISION, Config, render_identity, text_layer_identity, write_json)
+from rag_ocr_flags import OCR_FLAG_REVISION, alt_dpi, alt_texts, static_flags
 from rag_review import text_sha256
 # ページの判定は、wiki と同じ中身の rag_pdf_layer に置く（ADR-0025）。rag_pdf.inspect_page の名前も残す
 from rag_pdf_layer import inspect_page  # noqa: F401
@@ -32,21 +33,47 @@ UNKNOWN_RENDER = "unknown-rag-0.5"
 LEGACY_CACHE = re.compile(r"^(auto|always)-(\d+)-([0-9a-f]{12})-" + re.escape(LEGACY_EXTRACT_REVISION) + "$")
 
 
+def _render(page, dpi: int, path: Path) -> None:
+    bitmap = page.render(scale=dpi / 72)
+    try:
+        bitmap.to_pil().save(path)
+    finally:
+        bitmap.close()
+
+
 def ocr_page(page, config: Config, work: Path, client=None) -> dict:
-    """ページを描画して OCR し、NDLOCR-Lite の応答（text、line_count）を返す。"""
+    """ページを描画して OCR し、NDLOCR-Lite の応答（text、line_count、lines）を返す。
+
+    client（OCR のワーカー）で OCR するときは、行の印（ADR-0025 の「行の印」）の材料も集める。ページを
+    ocr_dpi で描いて読み、行ごとに、ぼかした画像の読み（blur_text）も受け取る。ページを別の解像度
+    （alt_dpi）で描き直して検出から読み直し、行ごとにつながる行の本文（alt_text）を求め、印の理由（flags）を決める。
+    """
     # 原本ではなく、メモリ上の PDF から描画した一時画像を渡す。
     with tempfile.TemporaryDirectory(prefix="ocr-", dir=work, ignore_cleanup_errors=True) as directory:
         folder = Path(directory)
         image = folder / "page.png"
-        bitmap = page.render(scale=config.ocr_dpi / 72)
-        try:
-            bitmap.to_pil().save(image)
-        finally:
-            bitmap.close()
+        _render(page, config.ocr_dpi, image)
         if client is not None:
-            response = client.recognize(image)
-            return {"text": response["text"], "line_count": response.get("line_count"),
-                    "lines": response.get("lines"), "confidence_revision": response.get("confidence_revision")}
+            response = client.recognize(image, blur=True)
+            result = {"text": response["text"], "line_count": response.get("line_count"),
+                      "lines": response.get("lines"), "confidence_revision": response.get("confidence_revision")}
+            lines = response.get("lines")
+            if lines is None or response.get("blur_revision") is None:
+                return result  # 行の記録かぼかした読みがない（印は不明になる）
+            dpi = alt_dpi(config.ocr_dpi)
+            second = folder / "page-alt.png"
+            _render(page, dpi, second)
+            alt = client.recognize(second, blur=False)
+            if alt.get("lines") is None:
+                return result
+            marked = []
+            for line, text in zip(lines, alt_texts(lines, alt["lines"], config.ocr_dpi / dpi)):
+                line = {**line, "alt_text": text}
+                line["flags"] = static_flags(line)
+                marked.append(line)
+            result.update(lines=marked, flag_revision=OCR_FLAG_REVISION, blur_revision=response["blur_revision"],
+                          alt_render=render_identity(dpi))
+            return result
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
                "UV_CACHE_DIR": str(config.uv_cache_dir)}
         runner = Path(__file__).with_name("rag_ocr.py")
@@ -168,7 +195,11 @@ def confidence_record(response: dict) -> dict | None:
         return None
     if any(line.get("confidence") is None for line in lines):
         return None  # 不変条件を満たさない行があった（rag_ocr が確信度を付けなかった）
-    return {"revision": OCR_CONFIDENCE_REVISION, "lines": lines}
+    record = {"revision": OCR_CONFIDENCE_REVISION, "lines": lines}
+    if response.get("flag_revision") == OCR_FLAG_REVISION:
+        record.update(flag_revision=OCR_FLAG_REVISION, blur_revision=response.get("blur_revision"),
+                      alt_render=response.get("alt_render"))
+    return record
 
 
 def confidence_min(entry: dict | None) -> float | None:
@@ -178,6 +209,14 @@ def confidence_min(entry: dict | None) -> float | None:
         return None
     values = [line["confidence"] for line in record["lines"]]
     return min(values) if values else 1.0
+
+
+def page_flagged(entry: dict | None) -> bool | None:
+    """OCR したときに決まる印（"blur"、"alt"）の付いた行があるか。印の版が今と違えば None（印が不明）。"""
+    record = (entry or {}).get("confidence")
+    if not record or record.get("revision") != OCR_CONFIDENCE_REVISION or record.get("flag_revision") != OCR_FLAG_REVISION:
+        return None
+    return any(line.get("flags") for line in record["lines"])
 
 
 def _judgement_path(cache: Path, number: int) -> Path:
@@ -246,6 +285,8 @@ def extract_pages(data: bytes, config: Config, cache: Path, progress=None, ocr_c
                           "ocr_sha256": text_sha256(text) if needs_ocr else None,
                           "confidence_min": confidence_min(found) if needs_ocr else None,
                           "confidence_revision": ((found or {}).get("confidence") or {}).get("revision") if needs_ocr else None,
+                          "flagged": page_flagged(found) if needs_ocr else None,
+                          "flag_revision": ((found or {}).get("confidence") or {}).get("flag_revision") if needs_ocr else None,
                           "garble": entry["garble"], "needs_check": entry["needs_check"],
                           "text_sha256": entry["text_sha256"]}
             write_json(cache / f"page-{number:06d}.json", page_entry)
@@ -288,11 +329,13 @@ def page_report(data: bytes, config: Config, cache: Path) -> dict:
             "lists": lists, "extraction": text_layer_identity(), "extract_revision": EXTRACT_REVISION,
             "ocr": {"mode": config.ocr_mode, "dpi": config.ocr_dpi, "revision": OCR_REVISION,
                     "render": render_identity(config.ocr_dpi), "store": config.ocr_key},
-            # 確信度の低いページは、返すときに、そのときの閾値で数える（Jobs.status）。ここには最小値だけを持つ
+            # 印の付いた行があるページは、返すときに、そのときの閾値で数える（Jobs.status）。ここには、確信度の最小値と、
+            # OCR したときに決まった印（blur、alt）の付いた行があるかだけを持つ
             "confidence": {"revision": OCR_CONFIDENCE_REVISION,
                            "pages": {str(n): {"ocr": True, "ocr_sha256": e.get("ocr_sha256"),
                                               "confidence_min": e.get("confidence_min"),
-                                              "confidence_revision": e.get("confidence_revision")}
+                                              "confidence_revision": e.get("confidence_revision"),
+                                              "flagged": e.get("flagged"), "flag_revision": e.get("flag_revision")}
                                      for n, e in sorted(done.items()) if e.get("ocr")}}}
 
 

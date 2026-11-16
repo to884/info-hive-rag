@@ -43,11 +43,12 @@ class OcrClient:
                                 ctypes.c_void_p,ctypes.POINTER(wintypes.DWORD),ctypes.c_void_p]
             self._peek.restype=wintypes.BOOL
 
-    def recognize(self,image: Path,timeout: float=1800)->dict:
+    def recognize(self,image: Path,timeout: float=1800,blur: bool=False)->dict:
+        # blur を真にすると、行ごとに、ぼかした画像を読んだ本文（blur_text）も返す（ADR-0025 の「行の印」）
         if self.process is None: self._start()
         if self.process.poll() is not None:
             raise RuntimeError('OCR ワーカーが終了しました。保存済みのページから再開してください。')
-        self.process.stdin.write(json.dumps({'image':str(image.resolve())},ensure_ascii=False)+'\n')
+        self.process.stdin.write(json.dumps({'image':str(image.resolve()),'blur':bool(blur)},ensure_ascii=False)+'\n')
         self.process.stdin.flush()
         deadline=time.monotonic()+timeout
         while time.monotonic()<deadline:

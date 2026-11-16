@@ -64,6 +64,28 @@ class ConfidentRecognizer:
         return ProbStr(text, chars, eos, 1)
 
 
+# 行の印の「ぼかした読み」（ADR-0025 の「行の印」）。ぼかしの強さと読み方を変えたら上げる
+BLUR_REVISION = "blur-v1"
+BLUR_SIGMA = 0.7
+
+
+def blur_text(recognizer100, image) -> str:
+    """行の画像に、標準偏差 BLUR_SIGMA ピクセルのガウスぼかしをかけ、100 文字用の認識器で読んだ本文を返す。
+
+    NDLOCR-Lite の process_cascade と同じく、98 文字以上に読めた横書きの行は、左右に分けて読み、つなぐ。
+    """
+    import cv2
+
+    if image is None or image.size == 0:
+        return ""
+    blurred = cv2.GaussianBlur(image, (0, 0), BLUR_SIGMA)
+    text = str(recognizer100.read(blurred))
+    if len(text) >= 98 and blurred.shape[0] < blurred.shape[1]:
+        half = blurred.shape[1] // 2
+        text = str(recognizer100.read(blurred[:, :half, :])) + str(recognizer100.read(blurred[:, half:, :]))
+    return text
+
+
 def line_records(json_lines: list[dict]) -> list[dict]:
     """NDLOCR-Lite の json_lines から、保存する行の記録を作る。
 

@@ -155,7 +155,9 @@ async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0, page_re
 @server.tool()
 def ocr_page_detail(wiki_root: str, job_id: str, page: int) -> dict:
     """完了した取り込みのジョブの、OCR したページの詳しいことを返す（ADR-0025）。OCR の本文、その SHA-256、
-    確信度の低い行（行の番号、本文、確信度、ページの中の位置）、今の確認の結果と履歴、台帳の確認の版、公開した確認の版。
+    印の付いた行（flagged_lines。行の番号、本文、印の理由 reasons（low: 確信度が閾値より低い、blur: ぼかした読みと違う、
+    alt: 別の解像度の読みと違い確信度が 0.9 未満）、ぼかした読み blur_text、別の解像度の読み alt_text、確信度、ページの中の位置）、
+    今の確認の結果と履歴、台帳の確認の版、公開した確認の版。
     OCR の本文は共有の抽出の結果から返すので、直したり却下したりしたあとでも、元の OCR の本文が分かる。"""
     from rag_review import page_detail
     doc_id = jobs().completed_document(wiki_root, job_id)
@@ -164,7 +166,7 @@ def ocr_page_detail(wiki_root: str, job_id: str, page: int) -> dict:
 
 @server.tool()
 def decide_ocr_pages(wiki_root: str, job_id: str, base_version: int, decisions: list[dict]) -> dict:
-    """OCR の確信度の低いページの確認の結果を受け付ける（ADR-0025）。decisions はページごとに
+    """OCR の印の付いた行があるページの確認の結果を受け付ける（ADR-0025）。decisions はページごとに
     {"page", "action": accept / fix / reject, "text"（fix のとき、直した本文）, "decided_by": user / agent_draft_approved,
     "ocr_sha256"（ocr_page_detail で確かめた OCR の本文の SHA-256）}。base_version は、もとにした台帳の確認の版
     （ocr_page_detail の ledger_version）。台帳の版か SHA-256 が今と違えば受け付けない。受け付けたら台帳の版を上げ、
