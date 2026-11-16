@@ -58,8 +58,8 @@ def ocr_page(page, config: Config, work: Path, client=None) -> dict:
             result = {"text": response["text"], "line_count": response.get("line_count"),
                       "lines": response.get("lines"), "confidence_revision": response.get("confidence_revision")}
             lines = response.get("lines")
-            if lines is None or response.get("blur_revision") is None:
-                return result  # 行の記録かぼかした読みがない（印は不明になる）
+            if lines is None or response.get("blur_revision") is None or response.get("rapid_revision") is None:
+                return result  # 行の記録か、ぼかした読みか、別の認識器の読みがない（印は不明になる）
             dpi = alt_dpi(config.ocr_dpi)
             second = folder / "page-alt.png"
             _render(page, dpi, second)
@@ -72,7 +72,7 @@ def ocr_page(page, config: Config, work: Path, client=None) -> dict:
                 line["flags"] = static_flags(line)
                 marked.append(line)
             result.update(lines=marked, flag_revision=OCR_FLAG_REVISION, blur_revision=response["blur_revision"],
-                          alt_render=render_identity(dpi))
+                          rapid_revision=response["rapid_revision"], alt_render=render_identity(dpi))
             return result
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
                "UV_CACHE_DIR": str(config.uv_cache_dir)}
@@ -198,7 +198,7 @@ def confidence_record(response: dict) -> dict | None:
     record = {"revision": OCR_CONFIDENCE_REVISION, "lines": lines}
     if response.get("flag_revision") == OCR_FLAG_REVISION:
         record.update(flag_revision=OCR_FLAG_REVISION, blur_revision=response.get("blur_revision"),
-                      alt_render=response.get("alt_render"))
+                      rapid_revision=response.get("rapid_revision"), alt_render=response.get("alt_render"))
     return record
 
 

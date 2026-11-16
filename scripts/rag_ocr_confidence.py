@@ -86,6 +86,27 @@ def blur_text(recognizer100, image) -> str:
     return text
 
 
+# 行の印の「別の認識器の読み」（ADR-0025 の「行の印」）。認識器か読み方を変えたら上げる
+RAPID_REVISION = "rapidocr-3.10.0-ja-v1"
+
+
+def rapid_reader():
+    """RapidOCR の日本語の認識モデル（認識だけ、検出なし）で行の画像を読む関数を返す。"""
+    from rapidocr import LangRec, RapidOCR
+
+    engine = RapidOCR(params={"Rec.lang_type": LangRec.JAPAN})
+
+    def read(image) -> str | None:
+        if image is None or image.size == 0:
+            return ""
+        if image.shape[0] > image.shape[1]:
+            return None  # 縦書きの行は読まない（横書き向けの認識器）
+        result = engine(image, use_det=False, use_cls=False, use_rec=True)
+        return "".join(result.txts or [])
+
+    return read
+
+
 def line_records(json_lines: list[dict]) -> list[dict]:
     """NDLOCR-Lite の json_lines から、保存する行の記録を作る。
 

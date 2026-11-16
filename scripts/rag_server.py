@@ -156,7 +156,8 @@ async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0, page_re
 def ocr_page_detail(wiki_root: str, job_id: str, page: int) -> dict:
     """完了した取り込みのジョブの、OCR したページの詳しいことを返す（ADR-0025）。OCR の本文、その SHA-256、
     印の付いた行（flagged_lines。行の番号、本文、印の理由 reasons（low: 確信度が閾値より低い、blur: ぼかした読みと違う、
-    alt: 別の解像度の読みと違い確信度が 0.9 未満）、ぼかした読み blur_text、別の解像度の読み alt_text、確信度、ページの中の位置）、
+    alt: 別の解像度の読みと違い確信度が 0.9 未満、rapid: 別の認識器の読みが英数字か記号を足すか置き換えた）、
+    ぼかした読み blur_text、別の解像度の読み alt_text、別の認識器の読み rapid_text、確信度、ページの中の位置）、
     今の確認の結果と履歴、台帳の確認の版、公開した確認の版。
     OCR の本文は共有の抽出の結果から返すので、直したり却下したりしたあとでも、元の OCR の本文が分かる。"""
     from rag_review import page_detail

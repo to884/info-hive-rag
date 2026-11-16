@@ -315,6 +315,7 @@ def page_detail(config, wiki: str, doc_id: str, page: int) -> dict:
             if reasons:
                 lines.append({"line": number, "text": line["text"], "reasons": reasons,
                               "blur_text": line.get("blur_text"), "alt_text": line.get("alt_text"),
+                              "rapid_text": line.get("rapid_text"),
                               "confidence": line["confidence"], "box": line.get("box"), "vertical": line.get("vertical")})
     snapshot = Ledger(folder).snapshot(doc_id, int(page), published)
     return {"page": int(page), "ocr_text": entry["text"], "ocr_sha256": entry["ocr_sha256"],
