@@ -314,8 +314,10 @@ class Jobs:
                 # 作り直しのジョブが受け持つ台帳の版を、実際に公開した版に合わせる。何もせずに終わった（deferred）なら
                 # 手放す（NULL）。受け持ったまま完了すると、公開していない版を二度と登録しなくなる
                 published = (result.get("review") or {}).get("published_version")
-                db.execute("UPDATE ingest_jobs SET review_version=? WHERE id=? AND kind='review' AND rerun=0",
-                           (None if result.get("status") == "deferred" else published, identity))
+                # 自分が持つ処理中のジョブだけを変える（完了を書く前に取り消されたジョブの受け持つ版は変えない）
+                db.execute("""UPDATE ingest_jobs SET review_version=? WHERE id=? AND owner=? AND status='running'
+                    AND kind='review' AND rerun=0""",
+                           (None if result.get("status") == "deferred" else published, identity, owner))
             # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
             if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
                                             "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=? "
