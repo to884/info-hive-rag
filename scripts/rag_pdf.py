@@ -105,19 +105,29 @@ class OcrStore:
         移すのは、同じ PDF（置き場所が文書ごと）、同じ ocr_dpi、同じ OCR の版の結果だけである。ocr_mode は
         auto と always のどちらの結果も移す（同じ描画と OCR の版なら、OCR の結果は同じである）。描画した
         pypdfium2 の版は記録されていないので、描画の識別を UNKNOWN_RENDER とし、移したときの描画の識別を
-        adopted_render に残す。移した元の置き場所は印（adopted.json）に記録し、もう一度は移さない。
-        0.4.0 が wiki ごとに置いた結果は移さない（0.5 の取り込みで、共有の置き場所に移してある）。
+        adopted_render に残す。0.4.0 が wiki ごとに置いた結果は移さない（0.5 の取り込みで、共有の置き場所に移してある）。
+
+        印（adopted.json）は、ページを写す前に書く。元ごとに、移し始めたときの描画の識別と状態（copying、done）を
+        記録し、写すページの adopted_render は印の値を使う。途中で止まったときは、描画の識別が印と同じときだけ
+        続きを写す。描画の識別が変わったあとは、その元からは写さない（同じ元からもう一度は移さない）。
         """
-        record = json.loads(self.marker.read_text(encoding="utf-8")) if self.marker.exists() else {"sources": {}}
-        moved = 0
         if not self.doc_root.is_dir():
             return 0
+        record = json.loads(self.marker.read_text(encoding="utf-8")) if self.marker.exists() else {"sources": {}}
+        moved = 0
         for source in sorted(self.doc_root.iterdir()):
             match = LEGACY_CACHE.match(source.name)
-            if not source.is_dir() or not match or source.name in record["sources"]:
+            if not source.is_dir() or not match:
                 continue
             if int(match.group(2)) != self.config.ocr_dpi or match.group(3) != OCR_REVISION[:12]:
                 continue
+            known = record["sources"].get(source.name)
+            if known is not None and (known["state"] == "done" or known["render"] != self.render):
+                continue
+            if known is None:
+                known = record["sources"][source.name] = {"render": self.render, "state": "copying",
+                                                          "started_at": time.time()}
+                write_json(self.marker, record)  # 写す前に、移し始めたことと描画の識別を残す
             pages = []
             for saved in sorted(source.glob("page-*.json")):
                 entry = json.loads(saved.read_text(encoding="utf-8"))
@@ -126,13 +136,12 @@ class OcrStore:
                     continue
                 write_json(self.path(number), {
                     "page": number, "text": entry["text"], "line_count": None, "render": UNKNOWN_RENDER,
-                    "adopted_render": self.render, "adopted_from": source.name, "ocr_revision": OCR_REVISION,
+                    "adopted_render": known["render"], "adopted_from": source.name, "ocr_revision": OCR_REVISION,
                     "store_revision": OCR_STORE_REVISION, "confidence": None, "saved_at": time.time()})
                 pages.append(number)
-            record["sources"][source.name] = {"render": self.render, "pages": rag_pdf_layer.page_ranges(pages),
-                                             "adopted_at": time.time()}
-            moved += len(pages)
+            known.update({"state": "done", "pages": rag_pdf_layer.page_ranges(pages), "done_at": time.time()})
             write_json(self.marker, record)
+            moved += len(pages)
         return moved
 
 
@@ -154,10 +163,12 @@ def extract_pages(data: bytes, config: Config, cache: Path, progress=None, ocr_c
     cache.mkdir(parents=True, exist_ok=True)
     doc_id = hashlib.sha256(data).hexdigest()
     count = rag_pdf_layer.pdfium_page_count(data)
+    key = config.extraction_key
     saved = {}
     for path in cache.glob("page-*.json"):
         entry = json.loads(path.read_text(encoding="utf-8"))
-        saved[int(entry["page"])] = entry
+        if entry.get("extraction_key") == key:  # 鍵の違う記録（置き場所の取り違えなど）は使わない
+            saved[int(entry["page"])] = entry
     missing = [number for number in range(1, count + 1) if number not in saved]
     if not missing:
         return [saved[number] for number in range(1, count + 1)]
@@ -175,7 +186,7 @@ def extract_pages(data: bytes, config: Config, cache: Path, progress=None, ocr_c
             kind = entry["kind"]
             needs_ocr = kind in OCR_KINDS or config.ocr_mode == "always"
             write_json(_judgement_path(cache, number), {
-                "page": number, "kind": kind, "quality": entry["quality"], "garble": entry["garble"],
+                "page": number, "extraction_key": key, "kind": kind, "quality": entry["quality"], "garble": entry["garble"],
                 "needs_check": entry["needs_check"], "text_sha256": entry["text_sha256"],
                 "text_empty": not entry["text"], "needs_ocr": needs_ocr})
             ocr_source = None
@@ -195,7 +206,7 @@ def extract_pages(data: bytes, config: Config, cache: Path, progress=None, ocr_c
             else:
                 # OCR しないページの本文は、wiki の wiki_pdf.py と同じ決まりにする（blank は本文を出さない）
                 text = entry["text"] if kind in ("text", "vertical") else ""
-            page_entry = {"page": number, "text": text, "quality": entry["quality"], "kind": kind,
+            page_entry = {"page": number, "extraction_key": key, "text": text, "quality": entry["quality"], "kind": kind,
                           "ocr": needs_ocr, "ocr_empty": needs_ocr and not text.strip(), "ocr_source": ocr_source,
                           "garble": entry["garble"], "needs_check": entry["needs_check"],
                           "text_sha256": entry["text_sha256"]}
@@ -213,13 +224,16 @@ def page_report(data: bytes, config: Config, cache: Path) -> dict:
     まとめた範囲の、すべての範囲を持つ（返すときに、Jobs.status が 200 個ずつに切る）。
     """
     count = rag_pdf_layer.pdfium_page_count(data)
+    key = config.extraction_key
     judged, done = {}, {}
     for path in cache.glob("judge-*.json"):
         entry = json.loads(path.read_text(encoding="utf-8"))
-        judged[int(entry["page"])] = entry
+        if entry.get("extraction_key") == key:
+            judged[int(entry["page"])] = entry
     for path in cache.glob("page-*.json"):
         entry = json.loads(path.read_text(encoding="utf-8"))
-        done[int(entry["page"])] = entry
+        if entry.get("extraction_key") == key:
+            done[int(entry["page"])] = entry
 
     def listed(numbers) -> dict:
         numbers = sorted(set(numbers))

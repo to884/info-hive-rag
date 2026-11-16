@@ -160,10 +160,22 @@ class Config:
             raise ValueError("source_page は wiki 内の sources/<スラッグ>.md にしてください。")
         return page.relative_to(wiki).as_posix()
 
+    def _base_policy(self) -> list:
+        return ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
+                self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
+
+    @property
+    def legacy_fingerprint(self) -> str:
+        """rag 0.4.0〜0.5.3（抽出の版 extract-v1）の式で計算した、この設定の指紋。
+
+        0.4.0 が wiki ごとに置いた抽出の結果の場所（sha256(doc_id + 指紋)）を探して後始末するために使う。
+        今の指紋（fingerprint）とは、抽出の版と文字の層の識別を入れない点が違う。
+        """
+        return hashlib.sha256(json.dumps(self._base_policy()).encode("utf-8")).hexdigest()
+
     @property
     def fingerprint(self) -> str:
-        policy = ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
-                  self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
+        policy = self._base_policy()
         # 抽出の版を上げたら、索引の方針も変わる（取り込み直しで抽出と埋め込みをやり直す）。extract-v1 のあいだは、
         # 0.4.0 の索引をそのまま使えるよう、0.4.0 と同じ値にする（ADR-0014）。
         if EXTRACT_REVISION != LEGACY_EXTRACT_REVISION:

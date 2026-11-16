@@ -312,18 +312,24 @@ class Engine:
     def _legacy_generations(self, folder: Path, doc_id: str, stale: dict | None) -> list[str]:
         """0.4.0 が抽出の結果を置いた generation（0.4.0 の式 sha256(doc_id + 指紋)）の候補。今の指紋のものと、
         前の方針（今の索引の方針と、空にした索引の方針）のうち埋め込みのモデルだけが違うもの。どれも、OCR の設定が
-        今と同じであることが指紋から分かる。抽出の版は指紋に入らないので、移すかどうかは呼び出し側が版で決める。"""
-        fingerprints = [self.config.fingerprint]
+        今と同じであることが指紋から分かる。抽出の版は指紋に入らないので、移すかどうかは呼び出し側が版で決める。
+
+        0.4.0 の generation は 0.4.0 の式の指紋（Config.legacy_fingerprint）で決まる。rag 0.6.0 で指紋に抽出の版を
+        入れたので、今の指紋ではなく、0.4.0 の式で計算し直して照らす（ADR-0025）。
+        記録した前の方針の指紋は、0.5.3 までに記録したものは 0.4.0 の式の値、0.6.0 からは今の式の値である。
+        どちらでも、その設定の 0.4.0 の式の指紋を候補にする。"""
+        fingerprints = [self.config.legacy_fingerprint]
         for policy in ([stale] if stale else []) + self._previous_policies(folder):
-            if policy.get("model") not in MODELS or policy.get("fingerprint") in fingerprints:
+            if policy.get("model") not in MODELS:
                 continue
             try:
                 previous = Config({**self.config.values, "data_dir": str(self.config.data_dir),
                                    "embedding_model": policy["model"], "embedding_revision": policy.get("revision")})
             except ValueError:
                 continue
-            if previous.fingerprint == policy["fingerprint"]:
-                fingerprints.append(policy["fingerprint"])
+            if policy.get("fingerprint") in (previous.legacy_fingerprint, previous.fingerprint) \
+                    and previous.legacy_fingerprint not in fingerprints:
+                fingerprints.append(previous.legacy_fingerprint)
         return [hashlib.sha256((doc_id + value).encode("ascii")).hexdigest() for value in fingerprints]
 
     @staticmethod
