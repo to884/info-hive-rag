@@ -45,7 +45,8 @@ class Jobs:
             # rag 0.6.0 で、確認を当てる作り直しのジョブ（kind='review'）を足した（ADR-0025）。前の版の台帳には列を足す。
             columns = {row[1] for row in db.execute("PRAGMA table_info(ingest_jobs)")}
             for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'ingest'"), ("doc_id", "TEXT"),
-                                      ("rerun", "INTEGER NOT NULL DEFAULT 0"), ("review_version", "INTEGER")):
+                                      ("rerun", "INTEGER NOT NULL DEFAULT 0"), ("review_version", "INTEGER"),
+                                      ("queued_at", "REAL")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE ingest_jobs ADD COLUMN {name} {declaration}")
 
@@ -293,7 +294,10 @@ class Jobs:
     def claim(self, owner: str) -> dict | None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM ingest_jobs WHERE status IN ('queued','paused') ORDER BY created_at LIMIT 1").fetchone()
+            # 待ちに入った順に取る。rerun と再試行で待ちに戻ったジョブは、戻った時点で列の最後に並ぶ（同じ文書に確認が
+            # 続いても、ほかの文書の作り直しと取り込みを追い越し続けない。ADR-0025）
+            row = db.execute("""SELECT * FROM ingest_jobs WHERE status IN ('queued','paused')
+                ORDER BY COALESCE(queued_at, created_at), created_at LIMIT 1""").fetchone()
             if row is None:
                 return None
             db.execute("UPDATE ingest_jobs SET status='running',phase='開始',owner=?,attempts=attempts+1,error=NULL,updated_at=? WHERE id=?",
@@ -329,7 +333,7 @@ class Jobs:
                            (None if result.get("status") == "deferred" else published, identity, owner))
             # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
             if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
-                                            "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=? "
+                                            "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=?,queued_at=updated_at "
                                             "WHERE id=? AND owner=? AND status='running' "
                                             "AND kind='review' AND rerun=1",
                                             (json.dumps(result, ensure_ascii=False) if result is not None else None,
@@ -365,11 +369,11 @@ class Jobs:
                     AND status IN ('queued','running','paused') LIMIT 1""", (current["wiki"], current["doc_id"], job_id)).fetchone()
                 if row is None:
                     db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,"
-                               "publication_started=0,updated_at=? WHERE id=? AND status IN ('failed','cancelled')",
+                               "publication_started=0,updated_at=?,queued_at=updated_at WHERE id=? AND status IN ('failed','cancelled')",
                                (time.time(), job_id))
             return self.status(current["wiki"], row[0] if row else job_id)
         with self.connect() as db:
             # 前の試行の「公開を始めた」印を戻す（新しい試行は、まだ公開を始めていないので取り消せる）
             db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,publication_started=0,"
-                       "updated_at=? WHERE id=? AND status IN ('failed','cancelled')", (time.time(), job_id))
+                       "updated_at=?,queued_at=updated_at WHERE id=? AND status IN ('failed','cancelled')", (time.time(), job_id))
         return self.status(current["wiki"], job_id)
