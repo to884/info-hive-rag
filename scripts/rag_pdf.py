@@ -107,27 +107,36 @@ class OcrStore:
         pypdfium2 の版は記録されていないので、描画の識別を UNKNOWN_RENDER とし、移したときの描画の識別を
         adopted_render に残す。0.4.0 が wiki ごとに置いた結果は移さない（0.5 の取り込みで、共有の置き場所に移してある）。
 
-        印（adopted.json）は、ページを写す前に書く。元ごとに、移し始めたときの描画の識別と状態（copying、done）を
-        記録し、写すページの adopted_render は印の値を使う。途中で止まったときは、描画の識別が印と同じときだけ
-        続きを写す。描画の識別が変わったあとは、その元からは写さない（同じ元からもう一度は移さない）。
+        移すのは、文書ごとに 1 つの描画の識別のときだけである。印（adopted.json）の render に、最初に移し始めた
+        ときの描画の識別を、ページを写す前に書く。どの元から写すページも、adopted_render はこの値にする。
+        今の描画の識別が印の render と違えば、どの元からも写さない（途中で止まった元も、まだ写していない元も）。
+        元ごとの状態（copying、done）も記録し、同じ描画の識別のあいだは、途中で止まった元の続きを写す。
         """
         if not self.doc_root.is_dir():
             return 0
-        record = json.loads(self.marker.read_text(encoding="utf-8")) if self.marker.exists() else {"sources": {}}
-        moved = 0
+        sources = []
         for source in sorted(self.doc_root.iterdir()):
             match = LEGACY_CACHE.match(source.name)
-            if not source.is_dir() or not match:
-                continue
-            if int(match.group(2)) != self.config.ocr_dpi or match.group(3) != OCR_REVISION[:12]:
-                continue
+            if source.is_dir() and match and int(match.group(2)) == self.config.ocr_dpi \
+                    and match.group(3) == OCR_REVISION[:12]:
+                sources.append(source)
+        if not sources:
+            return 0
+        record = json.loads(self.marker.read_text(encoding="utf-8")) if self.marker.exists() else {"render": None, "sources": {}}
+        if record["render"] is None:
+            record["render"] = self.render
+            record["started_at"] = time.time()
+            write_json(self.marker, record)  # 写す前に、移す描画の識別を文書ごとに 1 つだけ残す
+        if record["render"] != self.render:
+            return 0  # 描画の識別が変わったあとは、どの元からも移さない
+        moved = 0
+        for source in sources:
             known = record["sources"].get(source.name)
-            if known is not None and (known["state"] == "done" or known["render"] != self.render):
+            if known is not None and known["state"] == "done":
                 continue
             if known is None:
-                known = record["sources"][source.name] = {"render": self.render, "state": "copying",
-                                                          "started_at": time.time()}
-                write_json(self.marker, record)  # 写す前に、移し始めたことと描画の識別を残す
+                known = record["sources"][source.name] = {"state": "copying", "started_at": time.time()}
+                write_json(self.marker, record)
             pages = []
             for saved in sorted(source.glob("page-*.json")):
                 entry = json.loads(saved.read_text(encoding="utf-8"))
@@ -136,7 +145,7 @@ class OcrStore:
                     continue
                 write_json(self.path(number), {
                     "page": number, "text": entry["text"], "line_count": None, "render": UNKNOWN_RENDER,
-                    "adopted_render": known["render"], "adopted_from": source.name, "ocr_revision": OCR_REVISION,
+                    "adopted_render": record["render"], "adopted_from": source.name, "ocr_revision": OCR_REVISION,
                     "store_revision": OCR_STORE_REVISION, "confidence": None, "saved_at": time.time()})
                 pages.append(number)
             known.update({"state": "done", "pages": rag_pdf_layer.page_ranges(pages), "done_at": time.time()})
