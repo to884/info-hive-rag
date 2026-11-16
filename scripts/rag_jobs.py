@@ -184,13 +184,22 @@ class Jobs:
         published_version, ledger_version, ledger_decisions, published_decisions, published = 0, 0, {}, {}, None
         if doc_id:
             folder = Config(job_config).workspace(wiki)
-            published = published_documents(folder).get(doc_id)
+            # 公開している generation を読んでから要約を読むあいだに、次の版の公開と前の版の後始末が入ると、要約が消える。
+            # generation を読み直し、要約と同じ時点のものだけを使う。前のジョブの記録の要約には戻らない（OCR の本文が
+            # 変わったあとに、古くなった確認を当たっていると誤って示すため）
+            published, loaded = None, None
+            for _ in range(5):
+                published = published_documents(folder).get(doc_id)
+                if not published:
+                    break
+                loaded = load_summary(folder, doc_id, published["generation"])
+                if loaded is not None or published_documents(folder).get(doc_id) == published:
+                    break
             snapshot = Ledger(folder).state(doc_id, published["review_version"] if published else 0)
             ledger_version = snapshot["version"]
             if published:
                 published_version = published["review_version"]
-                loaded = load_summary(folder, doc_id, published["generation"])
-                summary = loaded if loaded is not None else summary  # 空の要約も、公開している版の正しい結果
+                summary = loaded if loaded is not None else {}  # 要約がない版では、確認の状態を返さない
                 ledger_decisions, published_decisions = snapshot["latest"], snapshot["published"]
         lists = dict(report["lists"])
         for name, numbers in review_lists(summary, ledger_decisions, published_decisions, threshold).items():
@@ -326,9 +335,10 @@ class Jobs:
                                             (json.dumps(result, ensure_ascii=False) if result is not None else None,
                                              time.time(), identity, owner)).rowcount:
                 return
+            failed = error is not None  # 空の文字列も失敗として扱う（メッセージのない例外など）
             db.execute("""UPDATE ingest_jobs SET status=?,phase=?,result=?,error=?,owner=NULL,updated_at=?
                 WHERE id=? AND owner=? AND status='running'""",
-                ("failed" if error else "completed", "失敗" if error else "完了",
+                ("failed" if failed else "completed", "失敗" if failed else "完了",
                  json.dumps(result, ensure_ascii=False) if result is not None else None,
                  error, time.time(), identity, owner))
 

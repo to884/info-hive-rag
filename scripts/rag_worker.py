@@ -222,7 +222,9 @@ def process_job(jobs: Jobs, owner: str, job: dict, engine) -> None:
     except Exception as error:
         # 失敗したときも、それまでに処理したページの情報を残す（ADR-0025）
         report = getattr(error, "page_report", None)
-        jobs.finish(job["id"], owner, error=str(error), result={"page_report": report} if report else None)
+        # メッセージのない例外（RuntimeError() など）でも、空でない理由を残す
+        message = str(error) or type(error).__name__
+        jobs.finish(job["id"], owner, error=message, result={"page_report": report} if report else None)
 
 
 if __name__ == "__main__":
