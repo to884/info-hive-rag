@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import io
+import itertools
 import math
 import re
 from collections.abc import Iterator
@@ -201,11 +202,10 @@ def _stable_converter(manager, output, laparams):
     return StableTextConverter(manager, output, codec="utf-8", laparams=laparams)
 
 
-def pdfminer_pages(data: bytes, start: int = 1, stop: int | None = None) -> Iterator[tuple[int, str]]:
-    """文書を 1 回だけ読み、ページの番号（1 から）と文字の層の本文を順に返す。
+def _converter_pages(data: bytes, start: int = 1, stop: int | None = None) -> Iterator[tuple[int, str]]:
+    """文書を 1 回だけ読み、ページの番号（1 から）と、TextConverter が書いたままの本文を順に返す。
 
-    start より前のページは読み飛ばす（解析しない）。stop を渡すと、そのページまでで止める。
-    本文は改行を \\n にそろえ、前後の空白を除いたものである。
+    start より前のページは解析しない。stop を渡すと、そのページまでで止め、次のページは組み立てない。
     """
     from pdfminer.layout import LAParams
     from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
@@ -216,18 +216,30 @@ def pdfminer_pages(data: bytes, start: int = 1, stop: int | None = None) -> Iter
         raise RuntimeError("all_texts を有効にすると、図の中の組の順が決まらない")
     output = io.StringIO()
     manager = PDFResourceManager()
+    pages = PDFPage.get_pages(io.BytesIO(data))
+    if stop is not None:
+        pages = itertools.islice(pages, stop)
     with _stable_converter(manager, output, laparams) as device:
         interpreter = PDFPageInterpreter(manager, device)
-        for number, page in enumerate(PDFPage.get_pages(io.BytesIO(data)), start=1):
-            if stop is not None and number > stop:
-                return
+        for number, page in enumerate(pages, start=1):
             if number < start:
                 continue
             interpreter.process_page(page)
-            text = normalize_newlines(output.getvalue()).replace("\f", "").strip()
+            text = output.getvalue()
             output.seek(0)
             output.truncate(0)
             yield number, text
+
+
+def normalize_page_text(text: str) -> str:
+    """TextConverter が書いた 1 ページの本文を、比べる形にする（改行を \\n にそろえ、改ページの文字と前後の空白を除く）。"""
+    return normalize_newlines(text).replace("\f", "").strip()
+
+
+def pdfminer_pages(data: bytes, start: int = 1, stop: int | None = None) -> Iterator[tuple[int, str]]:
+    """ページの番号と、文字の層の本文（normalize_page_text の形）を順に返す。"""
+    for number, text in _converter_pages(data, start, stop):
+        yield number, normalize_page_text(text)
 
 
 def pdfium_page_count(data: bytes) -> int:
@@ -237,38 +249,39 @@ def pdfium_page_count(data: bytes) -> int:
         return len(document)
 
 
+def pdfminer_page_count(data: bytes) -> int:
+    """pdfminer が認めるページの数。ページツリーをたどるだけで、ページの中身は解析しない。"""
+    from pdfminer.pdfpage import PDFPage
+
+    return sum(1 for _ in PDFPage.get_pages(io.BytesIO(data)))
+
+
 def analyze_pages(data: bytes, start: int = 1, stop: int | None = None) -> Iterator[dict]:
     """ページごとに、判定、判定の数値、文字の層の本文、本文の崩れの数、確かめるべきかを返す。
 
-    PDFium と pdfminer のページの数が違えば止まる（ページの対応が取れない）。
+    最初のページを返す前に、PDFium と pdfminer のページの数を比べ、違えば止まる。途中のページだけを
+    読むときや、途中で読むのをやめるときも、ページの対応が取れない PDF の本文と判定を組み合わせない。
+    数が同じでも、ページの順が違えば対応は取れないが、それはここでは分からない（ADR-0025 の承認の条件 2）。
     """
     import pypdfium2 as pdfium
 
+    count = pdfium_page_count(data)
+    mined = pdfminer_page_count(data)
+    if mined != count:
+        raise RuntimeError(f"PDFium と pdfminer のページの数が違う（PDFium {count}、pdfminer {mined}）")
+    if count == 0:
+        return
+    if start < 1 or start > count:
+        raise ValueError(f"start は 1〜{count} にする（{start}）")
+    last = count if stop is None else min(stop, count)
     with pdfium.PdfDocument(data) as document:
-        count = len(document)
-        last = count if stop is None else min(stop, count)
-        seen = start - 1
         for number, text in pdfminer_pages(data, start, last):
-            if number > count:
-                break
             with closing(document[number - 1]) as page:
                 _, quality = inspect_page(page)
             counts = garble_counts(text)
-            seen = number
             yield {"page": number, "kind": quality["kind"], "quality": quality, "text": text,
                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                    "garble": counts, "needs_check": needs_check(quality, counts)}
-        if seen != last:
-            raise RuntimeError(f"PDFium と pdfminer のページの数が違う（PDFium {count}、pdfminer {seen} ページ目まで）")
-    if stop is None or stop >= count:
-        if sum(1 for _ in _pdfminer_page_objects(data)) != count:
-            raise RuntimeError("PDFium と pdfminer のページの数が違う")
-
-
-def _pdfminer_page_objects(data: bytes):
-    from pdfminer.pdfpage import PDFPage
-
-    return PDFPage.get_pages(io.BytesIO(data))
 
 
 def page_ranges(numbers: list[int]) -> list[str]:
