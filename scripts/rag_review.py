@@ -50,6 +50,7 @@ class Ledger:
                     doc_id TEXT NOT NULL, version INTEGER NOT NULL, page INTEGER NOT NULL,
                     action TEXT NOT NULL, text TEXT, decided_by TEXT NOT NULL, ocr_sha256 TEXT NOT NULL,
                     decided_at REAL NOT NULL, PRIMARY KEY (doc_id, version, page));
+                CREATE TABLE IF NOT EXISTS review_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
             with db:
                 yield db
@@ -73,6 +74,36 @@ class Ledger:
             found[int(row["page"])] = dict(row)
         return found
 
+    def versions(self) -> dict[str, int]:
+        """文書ごとの台帳の版。"""
+        if not self.path.exists():
+            return {}
+        with self.connect() as db:
+            return {row[0]: int(row[1]) for row in db.execute("SELECT doc_id,version FROM review_versions")}
+
+    def wiki(self) -> str | None:
+        """確認を受け付けた wiki のパス（作り直しのジョブを登録し直すときに使う）。"""
+        if not self.path.exists():
+            return None
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM review_meta WHERE key='wiki'").fetchone()
+        return row[0] if row else None
+
+    def snapshot(self, doc_id: str, page: int, published: int) -> dict:
+        """1 つの読み取りのトランザクションで、台帳の版、ページの最新の結果、公開した版までの結果、履歴を読む。
+
+        別々に読むと、あいだに別の確認が入ったとき、古い結果に新しい版を付けて返してしまう。
+        """
+        with self.connect() as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT version FROM review_versions WHERE doc_id=?", (doc_id,)).fetchone()
+            rows = [dict(item) for item in db.execute(
+                "SELECT * FROM review_decisions WHERE doc_id=? AND page=? ORDER BY version", (doc_id, int(page)))]
+        latest = rows[-1] if rows else None
+        upto = [item for item in rows if item["version"] <= published]
+        return {"version": int(row[0]) if row else 0, "latest": latest, "published": upto[-1] if upto else None,
+                "history": rows}
+
     def history(self, doc_id: str, page: int) -> list[dict]:
         if not self.path.exists():
             return []
@@ -80,7 +111,7 @@ class Ledger:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM review_decisions WHERE doc_id=? AND page=? ORDER BY version", (doc_id, page))]
 
-    def decide(self, doc_id: str, base_version: int, items: list[dict], current: dict[int, str]) -> int:
+    def decide(self, doc_id: str, base_version: int, items: list[dict], current: dict[int, str], wiki: str | None = None) -> int:
         """確認の結果を受け付け、新しい台帳の版を返す。
 
         base_version が台帳の版と違うか、確かめたときの OCR の本文の SHA-256（ocr_sha256）が今の OCR の本文
@@ -120,11 +151,19 @@ class Ledger:
                             item["decided_by"], item["ocr_sha256"], now))
             db.execute("INSERT INTO review_versions VALUES (?,?) ON CONFLICT(doc_id) DO UPDATE SET version=excluded.version",
                        (doc_id, version))
+            if wiki:
+                db.execute("INSERT INTO review_meta VALUES ('wiki',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (wiki,))
         return version
 
 
 def is_low(entry: dict, threshold: float) -> bool | None:
-    """OCR したページの確信度が低いか。確信度が不明なら None を返す（低いとも高いとも扱わない）。"""
+    """OCR したページの確信度が低いか。確信度が不明なら None を返す（低いとも高いとも扱わない）。
+
+    数え方の版（confidence_revision）が今と違う記録も、確信度が不明として扱う。
+    """
+    from rag_config import OCR_CONFIDENCE_REVISION
+    if entry.get("confidence_revision") != OCR_CONFIDENCE_REVISION:
+        return None
     minimum = entry.get("confidence_min")
     if minimum is None:
         return None
@@ -163,14 +202,21 @@ def apply_decisions(pages: list[dict], decisions: dict[int, dict]) -> list[dict]
 
 
 def confidence_summary(pages: list[dict]) -> dict:
-    """wiki の作業領域に置く、文書ごとのページの確信度の要約（検索の印と status の数で使う）。"""
+    """wiki の作業領域に置く、公開する版のページの確信度の要約（検索の印、status、page_report の確認の状態で使う）。"""
     return {"pages": {str(page["page"]): {"ocr": bool(page.get("ocr")), "ocr_sha256": page.get("ocr_sha256"),
-                                          "confidence_min": page.get("confidence_min")}
+                                          "confidence_min": page.get("confidence_min"),
+                                          "confidence_revision": page.get("confidence_revision")}
                       for page in pages if page.get("ocr")}}
 
 
-def load_summary(folder: Path, doc_id: str) -> dict[int, dict]:
-    path = Path(folder) / "reviewed" / doc_id / "confidence.json"
+def published_folder(folder: Path, doc_id: str, generation: str) -> Path:
+    """公開する版の成果物（確認を当てた本文と確信度の要約）の置き場所。公開の識別（generation）ごとに分け、
+    公開の前に書いても、公開している版の成果物を上書きしない。"""
+    return Path(folder) / "reviewed" / doc_id / generation
+
+
+def load_summary(folder: Path, doc_id: str, generation: str) -> dict[int, dict]:
+    path = published_folder(folder, doc_id, generation) / "confidence.json"
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -243,13 +289,13 @@ def page_detail(config, wiki: str, doc_id: str, page: int) -> dict:
         lines = [{"line": number, "text": line["text"], "confidence": line["confidence"], "box": line.get("box"),
                   "vertical": line.get("vertical")}
                  for number, line in enumerate(record["lines"], start=1) if line["confidence"] < threshold]
-    ledger = Ledger(folder)
+    snapshot = Ledger(folder).snapshot(doc_id, int(page), published)
     return {"page": int(page), "ocr_text": entry["text"], "ocr_sha256": entry["ocr_sha256"],
-            "confidence_min": entry.get("confidence_min"), "confidence_known": entry.get("confidence_min") is not None,
+            "confidence_min": entry.get("confidence_min"), "confidence_known": is_low(entry, threshold) is not None,
             "threshold": threshold, "low_lines": lines,
-            "state": page_state(entry, ledger.decisions(doc_id, upto=published).get(int(page)), threshold),
-            "decision": ledger.decisions(doc_id).get(int(page)), "history": ledger.history(doc_id, int(page)),
-            "ledger_version": ledger.version(doc_id), "published_version": published}
+            "state": page_state(entry, snapshot["published"], threshold),
+            "decision": snapshot["latest"], "history": snapshot["history"],
+            "ledger_version": snapshot["version"], "published_version": published}
 
 
 def decide(config, wiki: str, doc_id: str, base_version: int, items: list[dict]) -> int:
@@ -257,4 +303,34 @@ def decide(config, wiki: str, doc_id: str, base_version: int, items: list[dict])
     folder = config.workspace(wiki)
     published_state(folder, doc_id, config.fingerprint)
     current = {page: entry["ocr_sha256"] for page, entry in ocr_pages(config, doc_id).items()}
-    return Ledger(folder).decide(doc_id, base_version, items, current)
+    return Ledger(folder).decide(doc_id, base_version, items, current, wiki=str(Path(wiki).expanduser().resolve()))
+
+
+def published_documents(folder: Path) -> dict[str, dict]:
+    """その wiki の索引の文書ごとの、公開した generation と確認の版。"""
+    catalog = Path(folder) / "catalog.sqlite"
+    if not catalog.exists():
+        return {}
+    with closing(sqlite3.connect(catalog, timeout=15)) as db:
+        columns = {item[1] for item in db.execute("PRAGMA table_info(documents)")}
+        version = "review_version" if "review_version" in columns else "0"
+        return {row[0]: {"generation": row[1], "review_version": int(row[2])}
+                for row in db.execute(f"SELECT doc_id,generation,{version} FROM documents")}
+
+
+def pending_rebuilds(data_dir: Path) -> list[tuple[str, str]]:
+    """台帳の版が、公開した確認の版より新しい（wiki, 文書）の組。作り直しのジョブを状態から登録し直すために使う。
+
+    確認を台帳に書いたあと、作り直しのジョブを登録する前に止まっても、ここで見つかる（2 つの DB にまたがる取りこぼしを防ぐ）。
+    """
+    found = []
+    for folder in sorted((Path(data_dir) / "wikis-v2").glob("*")):
+        ledger = Ledger(folder)
+        wiki = ledger.wiki()
+        if not wiki:
+            continue
+        published = published_documents(folder)
+        for doc_id, version in ledger.versions().items():
+            if doc_id in published and version > published[doc_id]["review_version"]:
+                found.append((wiki, doc_id))
+    return found

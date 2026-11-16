@@ -125,6 +125,11 @@ def run(data_dir: str):
     threading.Thread(target=parent_closed, name="rag-parent-watch", daemon=True).start()
     try:
         jobs.recover()
+        try:
+            reconcile_rebuilds(jobs)
+        except Exception:
+            pass  # 登録し直しに失敗しても、ワーカーは動かす（次の待ちのあいだにもう一度試す）
+        reconciled = time.monotonic()
         engine, engine_key = None, None
         def get_engine(values):
             nonlocal engine, engine_key
@@ -145,12 +150,37 @@ def run(data_dir: str):
                 continue
             job = jobs.claim(owner)
             if job is None:
+                if time.monotonic() - reconciled > 60:
+                    # 待っているあいだも、台帳と公開した版の差から、作り直しのジョブを登録し直す
+                    try:
+                        reconcile_rebuilds(jobs)
+                    except Exception:
+                        pass
+                    reconciled = time.monotonic()
                 time.sleep(.02)
                 continue
             process_job(jobs, owner, job, get_engine(job["config"]))
     finally:
         jobs.pause(owner)
         lock.release()
+
+
+def reconcile_rebuilds(jobs: Jobs) -> list[dict]:
+        """台帳の版が公開した確認の版より新しい文書に、作り直しのジョブを登録し直す（ADR-0025）。
+
+        確認を台帳に書いたあと、作り直しのジョブを登録する前に止まっても、次にワーカーが起動したときに反映する。
+        """
+        from rag_review import pending_rebuilds
+        found = []
+        config = Config()
+        if Path(config.data_dir) != jobs.data_dir:
+            config = Config({**config.values, "data_dir": str(jobs.data_dir)})
+        for wiki, doc_id in pending_rebuilds(jobs.data_dir):
+            try:
+                found.append(jobs.register_rebuild(config, wiki, doc_id))
+            except ValueError:
+                continue  # wiki を消したなど
+        return found
 
 
 def process_job(jobs: Jobs, owner: str, job: dict, engine) -> None:

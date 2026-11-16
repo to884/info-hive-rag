@@ -245,6 +245,7 @@ def extract_pages(data: bytes, config: Config, cache: Path, progress=None, ocr_c
                           "ocr": needs_ocr, "ocr_empty": needs_ocr and not text.strip(), "ocr_source": ocr_source,
                           "ocr_sha256": text_sha256(text) if needs_ocr else None,
                           "confidence_min": confidence_min(found) if needs_ocr else None,
+                          "confidence_revision": ((found or {}).get("confidence") or {}).get("revision") if needs_ocr else None,
                           "garble": entry["garble"], "needs_check": entry["needs_check"],
                           "text_sha256": entry["text_sha256"]}
             write_json(cache / f"page-{number:06d}.json", page_entry)
@@ -290,7 +291,8 @@ def page_report(data: bytes, config: Config, cache: Path) -> dict:
             # 確信度の低いページは、返すときに、そのときの閾値で数える（Jobs.status）。ここには最小値だけを持つ
             "confidence": {"revision": OCR_CONFIDENCE_REVISION,
                            "pages": {str(n): {"ocr": True, "ocr_sha256": e.get("ocr_sha256"),
-                                              "confidence_min": e.get("confidence_min")}
+                                              "confidence_min": e.get("confidence_min"),
+                                              "confidence_revision": e.get("confidence_revision")}
                                      for n, e in sorted(done.items()) if e.get("ocr")}}}
 
 

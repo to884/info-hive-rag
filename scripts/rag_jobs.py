@@ -147,28 +147,35 @@ class Jobs:
         """page_report に、確信度の低いページと確認の状態を足す（ADR-0025 の「状態の表示」）。"""
         from rag_config import OCR_CONFIDENCE_THRESHOLD_CALIBRATED
         from rag_pdf_layer import page_ranges
-        from rag_review import Ledger, review_lists
+        from rag_review import Ledger, load_summary, published_documents, published_folder, review_lists
         confidence = report.get("confidence") or {}
+        # 確認の状態は、ジョブを保存したときの記録ではなく、その wiki で今公開している版の要約から作る
+        # （OCR をやり直して本文が変わったあとも、公開している版の状態を返す）。文書がその wiki の索引になければ、
+        # ジョブの記録の確信度だけを使い、確認の状態は返さない
         summary = {int(page): entry for page, entry in confidence.get("pages", {}).items()}
-        published_version, ledger_version, ledger_decisions, published_decisions = 0, 0, {}, {}
+        published_version, ledger_version, ledger_decisions, published_decisions, published = 0, 0, {}, {}, None
         if doc_id:
             folder = Config(job_config).workspace(wiki)
             ledger = Ledger(folder)
             ledger_version = ledger.version(doc_id)
-            catalog = folder / "catalog.sqlite"
-            if catalog.exists():
-                with closing(sqlite3.connect(catalog, timeout=15)) as db:
-                    columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
-                    row = db.execute("SELECT review_version FROM documents WHERE doc_id=?", (doc_id,)).fetchone() \
-                        if "review_version" in columns else None
-                published_version = int(row[0]) if row else 0
-            ledger_decisions = ledger.decisions(doc_id)
-            published_decisions = ledger.decisions(doc_id, upto=published_version)
+            published = published_documents(folder).get(doc_id)
+            if published:
+                published_version = published["review_version"]
+                summary = load_summary(folder, doc_id, published["generation"]) or summary
+                ledger_decisions = ledger.decisions(doc_id)
+                published_decisions = ledger.decisions(doc_id, upto=published_version)
         lists = dict(report["lists"])
         for name, numbers in review_lists(summary, ledger_decisions, published_decisions, threshold).items():
             lists[name] = {"count": len(numbers), "ranges": page_ranges(numbers)}
+        markdown = None
+        if published:
+            reviewed = published_folder(folder, doc_id, published["generation"]) / "document.md"
+            markdown = str(reviewed) if published_version and reviewed.exists() else None
         return {**report, "lists": lists,
-                "review": {"ledger_version": ledger_version, "published_version": published_version},
+                "review": {"ledger_version": ledger_version, "published_version": published_version,
+                           "indexed": bool(published),
+                           # 確認を当てた本文（公開している版）。確認の結果がなければ None（ジョブの extracted_markdown を読む）
+                           "extracted_markdown": markdown},
                 "confidence": {"revision": confidence.get("revision"), "threshold": threshold,
                                "threshold_calibrated": OCR_CONFIDENCE_THRESHOLD_CALIBRATED}}
 
@@ -302,6 +309,13 @@ class Jobs:
 
     def retry(self, wiki_root: str, job_id: str) -> dict:
         current = self.status(wiki_root, job_id)
+        if current.get("kind") == "review":
+            # 作り直しのジョブは、wiki と PDF ごとに 1 つだけ持つ。待っているか処理中のものがあれば、それを返す
+            with self.connect() as db:
+                row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND id!=?
+                    AND status IN ('queued','running','paused') LIMIT 1""", (current["wiki"], current["doc_id"], job_id)).fetchone()
+            if row:
+                return self.status(current["wiki"], row[0])
         with self.connect() as db:
             db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,updated_at=? WHERE id=? AND status IN ('failed','cancelled')",
                        (time.time(), job_id))
