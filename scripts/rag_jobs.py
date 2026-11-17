@@ -10,6 +10,8 @@ import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from filelock import FileLock
+
 from rag_config import Config
 
 
@@ -23,7 +25,9 @@ class Jobs:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         # 0.3.0 の jobs.sqlite は開かない（ADR-0013）。
         self.path = self.data_dir / "jobs-v2.sqlite"
-        with self.connect() as db:
+        # 台帳の作成と前の版からの移行を、プロセスをまたいで 1 本ずつ通す。同じ台帳を 2 つ以上の接続が同時に開くと、
+        # WAL への切り替え（busy_timeout が効かないことがある）と、列の一覧を読んでから列を足す段が競合する（PR #12）
+        with FileLock(str(self.data_dir / "jobs-v2.init.lock"), timeout=60), self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS ingest_jobs (
@@ -43,6 +47,9 @@ class Jobs:
                     updated_at REAL NOT NULL);
             """)
             # rag 0.6.0 で、確認を当てる作り直しのジョブ（kind='review'）を足した（ADR-0025）。前の版の台帳には列を足す。
+            # 列の一覧を読んでから列を足すまでを、書き込みのトランザクションでも守る（上のロックを使わずに台帳を
+            # 開く古い版のプロセスがあっても、"duplicate column name" で止まらないように）
+            db.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in db.execute("PRAGMA table_info(ingest_jobs)")}
             for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'ingest'"), ("doc_id", "TEXT"),
                                       ("rerun", "INTEGER NOT NULL DEFAULT 0"), ("review_version", "INTEGER"),
@@ -335,12 +342,15 @@ class Jobs:
                     AND kind='review' AND rerun=0""",
                            (None if result.get("status") == "deferred" else published, identity, owner))
             # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
+            # queued_at には今の時刻を別に渡す（SQLite の UPDATE の右辺は更新前の行で評価されるので、
+            # queued_at=updated_at では古い updated_at が入り、待っているジョブより前に並んでしまう）
+            now = time.time()
             if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
-                                            "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=?,queued_at=updated_at "
+                                            "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=?,queued_at=? "
                                             "WHERE id=? AND owner=? AND status='running' "
                                             "AND kind='review' AND rerun=1",
                                             (json.dumps(result, ensure_ascii=False) if result is not None else None,
-                                             time.time(), identity, owner)).rowcount:
+                                             now, now, identity, owner)).rowcount:
                 return
             failed = error is not None  # 空の文字列も失敗として扱う（メッセージのない例外など）
             db.execute("""UPDATE ingest_jobs SET status=?,phase=?,result=?,error=?,owner=NULL,updated_at=?
@@ -371,12 +381,14 @@ class Jobs:
                 row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND id!=?
                     AND status IN ('queued','running','paused') LIMIT 1""", (current["wiki"], current["doc_id"], job_id)).fetchone()
                 if row is None:
+                    now = time.time()  # queued_at は今の時刻（finish の再受付と同じ理由）
                     db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,"
-                               "publication_started=0,updated_at=?,queued_at=updated_at WHERE id=? AND status IN ('failed','cancelled')",
-                               (time.time(), job_id))
+                               "publication_started=0,updated_at=?,queued_at=? WHERE id=? AND status IN ('failed','cancelled')",
+                               (now, now, job_id))
             return self.status(current["wiki"], row[0] if row else job_id)
         with self.connect() as db:
             # 前の試行の「公開を始めた」印を戻す（新しい試行は、まだ公開を始めていないので取り消せる）
+            now = time.time()  # queued_at は今の時刻（finish の再受付と同じ理由）
             db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,publication_started=0,"
-                       "updated_at=?,queued_at=updated_at WHERE id=? AND status IN ('failed','cancelled')", (time.time(), job_id))
+                       "updated_at=?,queued_at=? WHERE id=? AND status IN ('failed','cancelled')", (now, now, job_id))
         return self.status(current["wiki"], job_id)
