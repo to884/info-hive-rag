@@ -125,6 +125,11 @@ def run(data_dir: str):
     threading.Thread(target=parent_closed, name="rag-parent-watch", daemon=True).start()
     try:
         jobs.recover()
+        try:
+            reconcile_rebuilds(jobs)
+        except Exception:
+            pass  # 登録し直しに失敗しても、ワーカーは動かす（次の待ちのあいだにもう一度試す）
+        reconciled = time.monotonic()
         engine, engine_key = None, None
         def get_engine(values):
             nonlocal engine, engine_key
@@ -134,36 +139,114 @@ def run(data_dir: str):
             if key != engine_key:
                 engine, engine_key = Engine(config), key
             return engine
+        streak = 0
         while True:
-            request = jobs.claim_search()
-            if request:
+            if time.monotonic() - reconciled > 60:
+                # 検索が続いていても、1 分おきに、台帳と公開した版の差から作り直しのジョブを登録し直す
                 try:
-                    result = get_engine(request["config"]).search(request["wiki"], request["query"], request["result_limit"])
-                    jobs.finish_search(request["id"], result=result)
+                    reconcile_rebuilds(jobs)
+                except Exception:
+                    pass
+                reconciled = time.monotonic()
+            kind, item, streak = next_work(jobs, owner, streak)
+            if kind == "search":
+                try:
+                    result = get_engine(item["config"]).search(item["wiki"], item["query"], item["result_limit"])
+                    jobs.finish_search(item["id"], result=result)
                 except Exception as error:
-                    jobs.finish_search(request["id"], error=str(error))
-                continue
-            job = jobs.claim(owner)
-            if job is None:
+                    jobs.finish_search(item["id"], error=str(error))
+            elif kind == "job":
+                process_job(jobs, owner, item, get_engine(engine_config(jobs, item)))
+            else:
                 time.sleep(.02)
-                continue
-            try:
-                source = Path(job["source"])
-                stat = source.stat()
-                if (stat.st_size, stat.st_mtime_ns) != (job["size"], job["mtime_ns"]):
-                    raise ValueError("登録後に PDF が変わりました。新しいジョブで取り込んでください。")
-                result = get_engine(job["config"]).ingest_pdf(job["wiki"], job["source"], job["source_page"], job["title"],
-                    progress=lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total),
-                    before_publish=lambda: jobs.begin_publication(job["id"], owner),
-                    expected=(job["dev"], job["ino"], job["size"], job["mtime_ns"]))
-                jobs.finish(job["id"], owner, result=result)
-            except JobCancelled:
-                pass
-            except Exception as error:
-                jobs.finish(job["id"], owner, error=str(error))
     finally:
         jobs.pause(owner)
         lock.release()
+
+
+# 検索を続けて処理するのは、この件数まで。そのあとは、待っているジョブを 1 つ処理する
+SEARCH_STREAK_LIMIT = 10
+
+
+def next_work(jobs: Jobs, owner: str, streak: int) -> tuple[str | None, dict | None, int]:
+    """次に処理するもの（"search"、"job"、None）と、それと、続けて処理した検索の数を返す。
+
+    検索を優先するが、SEARCH_STREAK_LIMIT 件続けたら、待っているジョブを先に取る。複数の接続から検索が途切れなく
+    来ても、取り込みと、確認を当てる作り直しに順番が回る（受け付けた確認を、いつか索引に反映するため。ADR-0025）。
+    """
+    if streak < SEARCH_STREAK_LIMIT:
+        request = jobs.claim_search()
+        if request:
+            return "search", request, streak + 1
+    job = jobs.claim(owner)
+    if job is not None:
+        return "job", job, 0
+    request = jobs.claim_search()
+    if request:
+        return "search", request, 1
+    return None, None, 0
+
+
+def engine_config(jobs: Jobs, job: dict) -> str:
+    """ジョブを動かす設定。取り込みは登録したときの設定、確認を当てる作り直しは今の設定（ADR-0025）。
+
+    作り直しを登録したときの設定で動かすと、そのあとで設定を変えて取り込み直した索引に当てられず、何もせずに終わる。
+    """
+    if job.get("kind") != "review":
+        return job["config"]
+    current = Config()
+    if Path(current.data_dir) != jobs.data_dir:
+        current = Config({**current.values, "data_dir": str(jobs.data_dir)})
+    return json.dumps(current.snapshot(), ensure_ascii=False)
+
+
+def reconcile_rebuilds(jobs: Jobs) -> list[dict]:
+        """台帳の版が公開した確認の版より新しい文書に、作り直しのジョブを登録し直す（ADR-0025）。
+
+        確認を台帳に書いたあと、作り直しのジョブを登録する前に止まっても、次にワーカーが起動したときに反映する。
+        """
+        from rag_review import pending_rebuilds
+        found = []
+        config = Config()
+        if Path(config.data_dir) != jobs.data_dir:
+            config = Config({**config.values, "data_dir": str(jobs.data_dir)})
+        for wiki, doc_id, version in pending_rebuilds(jobs.data_dir, config.fingerprint):
+            try:
+                # 走査で読んだ版を受け持たせる。その版を受け持ったジョブが（取り消し、失敗を含めて）あれば登録しない
+                registered = jobs.register_rebuild(config, wiki, doc_id, version)
+            except ValueError:
+                continue  # wiki を消したなど
+            if registered:
+                found.append(registered)
+        return found
+
+
+def process_job(jobs: Jobs, owner: str, job: dict, engine) -> None:
+    """取り出したジョブを 1 件処理し、結果か失敗を台帳に書く。"""
+    progress = lambda phase, completed, total: jobs.progress(job["id"], owner, phase, completed, total)  # noqa: E731
+    publish = lambda: jobs.begin_publication(job["id"], owner)  # noqa: E731
+    try:
+        if job.get("kind") == "review":
+            # 確認の結果を当てる作り直し（ADR-0025）。PDF は索引の台帳に記録した場所から読む
+            result = engine.rebuild_reviewed(job["wiki"], job["doc_id"], progress=progress, before_publish=publish)
+            jobs.finish(job["id"], owner, result=result)
+            return
+        source = Path(job["source"])
+        stat = source.stat()
+        if (stat.st_size, stat.st_mtime_ns) != (job["size"], job["mtime_ns"]):
+            raise ValueError("登録後に PDF が変わりました。新しいジョブで取り込んでください。")
+        result = engine.ingest_pdf(job["wiki"], job["source"], job["source_page"], job["title"],
+            progress=progress, before_publish=publish,
+            expected=(job["dev"], job["ino"], job["size"], job["mtime_ns"]))
+        jobs.finish(job["id"], owner, result=result)
+    except JobCancelled:
+        pass
+    except Exception as error:
+        # 失敗したときも、それまでに処理したページの情報を残す（ADR-0025）
+        report = getattr(error, "page_report", None)
+        # メッセージのない例外（RuntimeError() など）でも、空でない理由を残す
+        message = str(error) or type(error).__name__
+        jobs.finish(job["id"], owner, error=message, result={"page_report": report} if report else None)
 
 
 if __name__ == "__main__":

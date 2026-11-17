@@ -12,6 +12,10 @@ import time
 import uuid
 from pathlib import Path
 
+# 文字の層の取り出しと判定は、wiki と同じ中身の rag_pdf_layer に置く（ADR-0025）。版の定数もそこを正にする。
+# rag_pdf_layer は最上位で標準ライブラリだけを読み込むので、ここで読み込んでも pdfminer を必要としない。
+import rag_pdf_layer
+
 
 MODELS = {
     "cl-nagoya/ruri-v3-30m": 256,
@@ -23,9 +27,41 @@ DEFAULT_MODEL = "cl-nagoya/ruri-v3-130m"
 DEFAULT_REVISION = "e3114c6ee10dbab8b4b235fbc6dcf9dd4d5ac1a6"
 OCR_REVISION = "e57f7c6bd9cfb3de5f12f008e71ad2122bd44bfd"
 # ページの判定（文字化け、縦書き、スキャン）やテキストの取り出し方を変えたら上げる。抽出をやり直す（ADR-0014）。
-EXTRACT_REVISION = "extract-v1"
+# 値は rag_pdf_layer.EXTRACT_REVISION（wiki と同じ）。extract-v2 から、文字の層は pdfminer の本文になった（ADR-0025）。
+EXTRACT_REVISION = rag_pdf_layer.EXTRACT_REVISION
 # 0.4.0 の抽出は extract-v1 にあたる。0.4.0 が wiki ごとに置いた結果を移すのは、この版のときだけ。
 LEGACY_EXTRACT_REVISION = "extract-v1"
+# OCR の結果を別に保存する形の版（ADR-0025）。保存の形を変えたら上げる。
+# v2 から、別の解像度の読みと、行の印（rag_ocr_flags）を一緒に保存する。
+OCR_STORE_REVISION = "ocr-store-v2"
+# OCR の確信度の数え方の版（ADR-0025）。rag_ocr.py の数え方を変えたら上げる。版が違う結果は「確信度が不明」になる。
+# OCR の鍵には入れない（数え方を変えても OCR はやり直さない）。
+OCR_CONFIDENCE_REVISION = "confidence-v1"
+# 行の印の 1（確信度が低い）の閾値の既定値（ADR-0025 の「行の印」）。承認の条件 5 の選ぶ資料で選んだ値で、
+# 確かめる資料で確かめるまでは、page_report に「未校正」と出す。
+# 索引の方針の指紋には入れない（閾値を変えても、取り込み直しは要らない）。
+DEFAULT_OCR_CONFIDENCE_THRESHOLD = 0.3
+OCR_CONFIDENCE_THRESHOLD_CALIBRATED = False
+
+
+def text_layer_identity() -> dict:
+    """文字の層の識別（宣言した版）。保存の鍵と索引の指紋に入れる。
+
+    実際に読み込んだ版との照合は、取り出すとき（rag_pdf_layer.extraction_identity）に行う。指紋は MCP の
+    サーバーのプロセスでも計算するので、ここでは pdfminer を読み込まない。
+    """
+    return {"extract_revision": EXTRACT_REVISION, "order_revision": rag_pdf_layer.ORDER_REVISION,
+            "pdfminer.six": rag_pdf_layer.PDFMINER_VERSION, "laparams": dict(rag_pdf_layer.LAPARAMS),
+            "pypdfium2": rag_pdf_layer.PYPDFIUM2_VERSION}
+
+
+def render_identity(dpi: int) -> dict:
+    """OCR に渡す画像の描画の識別（pypdfium2 の宣言した版と dpi）。変われば OCR の結果を使い回さない。"""
+    return {"pypdfium2": rag_pdf_layer.PYPDFIUM2_VERSION, "dpi": int(dpi)}
+
+
+def short_hash(value: object, length: int = 12) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:length]
 MODEL_REVISIONS = {
     "cl-nagoya/ruri-v3-30m": "24899e5de370b56d179604a007c0d727bf144504",
     "cl-nagoya/ruri-v3-70m": "07a8b0aba47d29d2ca21f89b915c1efe2c23d1cc",
@@ -97,6 +133,9 @@ class Config:
         self.threads = int(values.get("cpu_threads", max(1, min(os.cpu_count() or 1, 8))))
         self.ocr_mode = values.get("ocr_mode", "auto")
         self.ocr_dpi = int(values.get("ocr_dpi", 150))
+        self.ocr_confidence_threshold = float(values.get("ocr_confidence_threshold", DEFAULT_OCR_CONFIDENCE_THRESHOLD))
+        if not (math.isfinite(self.ocr_confidence_threshold) and 0 < self.ocr_confidence_threshold <= 1):
+            raise ValueError("ocr_confidence_threshold は 0 より大きく 1 以下にしてください。")
         self.reranker = values.get("reranker", "off")
         self.rerank_limit = int(values.get("rerank_limit", 8))
         threshold = values.get("min_rerank_score")
@@ -133,20 +172,55 @@ class Config:
             raise ValueError("source_page は wiki 内の sources/<スラッグ>.md にしてください。")
         return page.relative_to(wiki).as_posix()
 
+    def _base_policy(self) -> list:
+        return ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
+                self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
+
+    @property
+    def legacy_fingerprint(self) -> str:
+        """rag 0.4.0〜0.5.3（抽出の版 extract-v1）の式で計算した、この設定の指紋。
+
+        0.4.0 が wiki ごとに置いた抽出の結果の場所（sha256(doc_id + 指紋)）を探して後始末するために使う。
+        今の指紋（fingerprint）とは、抽出の版と文字の層の識別を入れない点が違う。
+        """
+        return hashlib.sha256(json.dumps(self._base_policy()).encode("utf-8")).hexdigest()
+
     @property
     def fingerprint(self) -> str:
-        policy = ["rag-v2", self.model, self.revision, self.dimension, self.chunk_chars,
-                  self.overlap, self.ocr_mode, self.ocr_dpi, OCR_REVISION, "sudachi-C-normalized", "ruri-prefix-v1", "native-context-token-budget-v1"]
+        policy = self._base_policy()
         # 抽出の版を上げたら、索引の方針も変わる（取り込み直しで抽出と埋め込みをやり直す）。extract-v1 のあいだは、
         # 0.4.0 の索引をそのまま使えるよう、0.4.0 と同じ値にする（ADR-0014）。
         if EXTRACT_REVISION != LEGACY_EXTRACT_REVISION:
             policy.append(EXTRACT_REVISION)
-        return hashlib.sha256(json.dumps(policy).encode("utf-8")).hexdigest()
+            # extract-v2 からは、文字の層の識別（pdfminer の版、LAParams、並びの決め方、pypdfium2 の版）も入れる（ADR-0025）。
+            policy.append(text_layer_identity())
+        return hashlib.sha256(json.dumps(policy, sort_keys=True).encode("utf-8")).hexdigest()
 
     @property
     def extraction_key(self) -> str:
-        """抽出の結果の鍵。埋め込みのモデル、分割、題名は入れない（ADR-0014）。"""
-        return f"{self.ocr_mode}-{self.ocr_dpi}-{OCR_REVISION[:12]}-{EXTRACT_REVISION}"
+        """抽出の結果（ページごとの最終の本文）の鍵。埋め込みのモデル、分割、題名は入れない（ADR-0014）。
+
+        OCR の設定と、文字の層の識別の短い印を入れる。OCR の結果そのものは ocr_dir に別に保存し、
+        文字の層の取り出し方だけを変えたときは使い回す（ADR-0025）。
+        """
+        key = f"{self.ocr_mode}-{self.ocr_dpi}-{OCR_REVISION[:12]}-{EXTRACT_REVISION}"
+        if EXTRACT_REVISION != LEGACY_EXTRACT_REVISION:
+            key += "-" + short_hash(text_layer_identity(), 8)
+        return key
+
+    @property
+    def ocr_key(self) -> str:
+        """OCR の結果の鍵。描画の識別（pypdfium2 の版と dpi、読み直しの dpi）と OCR の版と印の版で決まる。
+        ocr_mode と文字の層は入れない。"""
+        from rag_ocr_flags import OCR_FLAG_REVISION, alt_dpi
+
+        render = {"render": render_identity(self.ocr_dpi), "alt_render": render_identity(alt_dpi(self.ocr_dpi)),
+                  "flags": OCR_FLAG_REVISION}
+        return f"{OCR_STORE_REVISION}-{OCR_REVISION[:12]}-{short_hash(render, 12)}"
+
+    def ocr_dir(self, doc_id: str) -> Path:
+        """OCR の結果の置き場所。抽出の結果と同じく文書ごとに置き、同じロックと後始末に乗せる。"""
+        return self.extraction_root / doc_id / "ocr" / self.ocr_key
 
     @property
     def extraction_root(self) -> Path:
@@ -161,8 +235,14 @@ class Config:
         """0.4.0 が wiki ごとに置いた抽出の結果（extract-v1）を、今の抽出の版の結果として使えるなら True。"""
         return EXTRACT_REVISION == LEGACY_EXTRACT_REVISION
 
-    def generation(self, doc_id: str) -> str:
-        """索引の行と埋め込みの途中経過の鍵。指紋（抽出の版を含む）が変われば変わるので、前の方針の途中経過を使い回さない。"""
+    def generation(self, doc_id: str, review_version: int = 0) -> str:
+        """索引の行と埋め込みの途中経過の鍵。指紋（抽出の版を含む）が変われば変わるので、前の方針の途中経過を使い回さない。
+
+        確認の結果を当てた版（review_version）も入れる（ADR-0025）。確認の版ごとに別の行と途中経過になり、前の版の
+        途中経過を使い回さない。版が 0（確認の結果がない）のときは、今までと同じ値にする。
+        """
+        if review_version:
+            return hashlib.sha256(f"{doc_id}{self.fingerprint}:review-{int(review_version)}".encode("ascii")).hexdigest()
         return hashlib.sha256((doc_id + self.fingerprint).encode("ascii")).hexdigest()
 
     @staticmethod

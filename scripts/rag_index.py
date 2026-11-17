@@ -16,8 +16,10 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from rag_config import MODELS, Config, write_json
-from rag_pdf import chunks_for, extract_pages
+from rag_config import MODELS, Config, text_layer_identity, write_json
+from rag_pdf import chunks_for, extract_pages, page_report
+from rag_review import (Ledger, apply_decisions, confidence_summary, load_summary, page_state, published_folder,
+                        review_lists)
 
 
 def file_id(info: os.stat_result) -> tuple[str, str] | None:
@@ -163,6 +165,20 @@ class Engine:
                 generation TEXT PRIMARY KEY, completed INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending', error TEXT);
         """)
+        # rag 0.6.0 で、公開した確認の版を文書の行に持たせた（ADR-0025）。前の版の台帳には列を足す。
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+        if "review_version" not in columns:
+            connection.execute("ALTER TABLE documents ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0")
+            connection.commit()
+        # 利用者が渡したままの PDF のパス（ネットワークドライブのドライブ文字のパス）を、場所の行に残す（ADR-0025）。
+        # 解決したパスは UNC になることがあり、確認を当て直すときに、登録の確かめで拒まれるため
+        if "source" not in {row[1] for row in connection.execute("PRAGMA table_info(locations)")}:
+            connection.execute("ALTER TABLE locations ADD COLUMN source TEXT")
+            connection.commit()
+        # 途中経過（jobs）に文書の列を足した。文書のすべての確認の版の途中経過を、文書で消せるようにする
+        if "doc_id" not in {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}:
+            connection.execute("ALTER TABLE jobs ADD COLUMN doc_id TEXT")
+            connection.commit()
         with closing(connection), connection:
             yield connection
 
@@ -312,18 +328,24 @@ class Engine:
     def _legacy_generations(self, folder: Path, doc_id: str, stale: dict | None) -> list[str]:
         """0.4.0 が抽出の結果を置いた generation（0.4.0 の式 sha256(doc_id + 指紋)）の候補。今の指紋のものと、
         前の方針（今の索引の方針と、空にした索引の方針）のうち埋め込みのモデルだけが違うもの。どれも、OCR の設定が
-        今と同じであることが指紋から分かる。抽出の版は指紋に入らないので、移すかどうかは呼び出し側が版で決める。"""
-        fingerprints = [self.config.fingerprint]
+        今と同じであることが指紋から分かる。抽出の版は指紋に入らないので、移すかどうかは呼び出し側が版で決める。
+
+        0.4.0 の generation は 0.4.0 の式の指紋（Config.legacy_fingerprint）で決まる。rag 0.6.0 で指紋に抽出の版を
+        入れたので、今の指紋ではなく、0.4.0 の式で計算し直して照らす（ADR-0025）。
+        記録した前の方針の指紋は、0.5.3 までに記録したものは 0.4.0 の式の値、0.6.0 からは今の式の値である。
+        どちらでも、その設定の 0.4.0 の式の指紋を候補にする。"""
+        fingerprints = [self.config.legacy_fingerprint]
         for policy in ([stale] if stale else []) + self._previous_policies(folder):
-            if policy.get("model") not in MODELS or policy.get("fingerprint") in fingerprints:
+            if policy.get("model") not in MODELS:
                 continue
             try:
                 previous = Config({**self.config.values, "data_dir": str(self.config.data_dir),
                                    "embedding_model": policy["model"], "embedding_revision": policy.get("revision")})
             except ValueError:
                 continue
-            if previous.fingerprint == policy["fingerprint"]:
-                fingerprints.append(policy["fingerprint"])
+            if policy.get("fingerprint") in (previous.legacy_fingerprint, previous.fingerprint) \
+                    and previous.legacy_fingerprint not in fingerprints:
+                fingerprints.append(previous.legacy_fingerprint)
         return [hashlib.sha256((doc_id + value).encode("ascii")).hexdigest() for value in fingerprints]
 
     @staticmethod
@@ -430,6 +452,8 @@ class Engine:
 
     def _maintain_indexes(self,folder,table,progress=None):
         from rag_indexes import Indexes
+        if table is None:
+            return None  # 行が 0 の版を、空にした索引に公開した。表がないので保守することもない
         return Indexes(self.config,folder,table,progress).maintain()
 
     def maintain_indexes(self,wiki_root: str,progress=None):
@@ -478,8 +502,28 @@ class Engine:
             affected.append(relative)
         return affected
 
+    @staticmethod
+    def _write_published(folder: Path, doc_id: str, generation: str, applied: list[dict] | None, pages: list[dict]) -> None:
+        """公開する版の成果物（確認を当てた本文と、確信度の要約）を、公開の識別ごとの置き場所に書く。
+
+        置き場所は generation（指紋と確認の版を含む）で分けるので、公開の前に書いても、公開している版の成果物を
+        上書きしない。applied が None（確認の結果がない）なら、本文は共有の document.md を使う。
+        """
+        target = published_folder(folder, doc_id, generation)
+        target.mkdir(parents=True, exist_ok=True)
+        if applied is not None:
+            Engine._write_markdown(target / "document.md", applied)
+        write_json(target / "confidence.json", confidence_summary(pages))
+
     def ingest_pdf(self, wiki_root: str, source: str, source_page: str, title: str = "", progress=None,
-                   before_publish=None, expected: tuple | None = None) -> dict:
+                   before_publish=None, expected: tuple | None = None, expected_doc_id: str | None = None,
+                   allow_reset: bool = True) -> dict:
+        """PDF を取り込み、台帳の最新の確認の版を当てた索引を公開する。
+
+        expected_doc_id を渡すと、読んだ PDF の SHA-256 がそれと違えば止まる（確認を当て直すときに、別の版の
+        PDF を取り込まない）。allow_reset が偽なら、方針が変わった索引を空にせず、status が deferred の結果を返す
+        （確認を当て直すジョブは、取り込み直しを起こさない）。
+        """
         wiki = Path(wiki_root).expanduser().resolve()
         folder = self.config.workspace(str(wiki))
         path = self.config.pdf_path(source)
@@ -489,6 +533,9 @@ class Engine:
         with FileLock(str(folder / "write.lock"), timeout=1800), ExitStack() as held:
             # 方針が変わった索引は、抽出が済んでから空にする。それまでは台帳の文書を今の方針のものとみなさない。
             stale = self._stale_policy(folder)
+            if stale and not allow_reset:
+                return {"status": "deferred", "message": "索引の方針が変わったので、取り込み直すまで確認の結果を当てません。"
+                        "取り込み直すと、記録した確認の結果を当てます。"}
             if not stale and not (folder / "policy.json").exists():
                 self._write_policy(folder)
             index_reset = False
@@ -500,168 +547,287 @@ class Engine:
                 if progress:
                     progress("PDF の読み込み", 1, 1)
                 doc_id = hashlib.sha256(data).hexdigest()
-                generation = self.config.generation(doc_id)
+                if expected_doc_id is not None and doc_id != expected_doc_id:
+                    raise ValueError("PDF の中身が、確認した版と違います。新しいジョブで取り込んでください。")
+                # 台帳の最新の確認の版を当てる。版ごとに別の generation にする（ADR-0025）。
+                ledger = Ledger(folder)
+                review_version = ledger.version(doc_id)
+                generation = self.config.generation(doc_id, review_version)
                 # 抽出の結果は wiki のあいだで共有する。使っているあいだは、ほかの取り込みの後始末で消させない。
                 held.enter_context(self._extraction_lock(doc_id))
                 cache = self.config.extraction_dir(doc_id)
-                self._adopt_legacy_extraction(folder, self._legacy_generations(folder, doc_id, stale), cache)
-                markdown = cache / "document.md"
-                existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-                if existing:
-                    pages_count, chunks_count = existing["pages"], existing["chunks"]
-                    # 索引の行は、記録した generation で入っている（抽出の版を上げる前の式のこともある）。
-                    generation = existing["generation"]
-                    skipped = True
-                    if not markdown.exists():
-                        # 索引にはあるが、今の抽出の設定の結果がない（抽出の版を上げた、結果を消したなど）。
-                        # 索引は作り直さず、返す本文のために抽出だけをやり直す。
-                        self._write_markdown(markdown, self.extractor(data, self.config, cache, progress))
-                else:
-                    skipped = False
-                    if not stale:
-                        connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
-                        connection.commit()
-                    try:
-                        pages = self.extractor(data, self.config, cache, progress)
-                        title = title.strip() or path.stem
-                        chunks = chunks_for(pages, title, self.config)
-                        if not chunks:
-                            raise ValueError("検索できるテキストがありません。取り込みは完了していません。")
-                        pages_count, chunks_count = len(pages), len(chunks)
+                try:
+                    self._adopt_legacy_extraction(folder, self._legacy_generations(folder, doc_id, stale), cache)
+                    markdown = cache / "document.md"
+                    existing = None if stale else connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+                    previous_generation = existing["generation"] if existing else None
+                    reviewed_markdown = (published_folder(folder, doc_id, generation) / "document.md") if review_version else None
+                    if existing and existing["review_version"] != review_version:
+                        # 台帳に、公開した版より新しい確認の結果がある。「同じ PDF と同じ指紋なら使い回す」の分岐を通らず作り直す
+                        title = title.strip() or existing["title"]
+                        existing = None
+                    if existing:
+                        pages_count, chunks_count = existing["pages"], existing["chunks"]
+                        # 索引の行は、記録した generation で入っている（抽出の版を上げる前の式のこともある）。
+                        generation = existing["generation"]
+                        skipped = True
                         if not markdown.exists():
-                            self._write_markdown(markdown, pages)
-                        # 方針が変わった索引は、最初のバッチの埋め込みが済んでから空にする。モデルの取得や読み込みに
-                        # 失敗しても、前の索引を壊さない。設定を戻せば、前の索引をそのまま使える。
-                        table = None if stale else self._table(folder, create=True)
-                        completed = 0 if stale else connection.execute(
-                            "SELECT completed FROM jobs WHERE generation=?", (generation,)).fetchone()[0]
-                        for start in range(completed, len(chunks), self.config.batch_size):
-                            if progress:
-                                progress("埋め込み", start, len(chunks))
-                            batch = chunks[start:start + self.config.batch_size]
-                            vectors = self.embedder.encode([chunk["embedding_text"] for chunk in batch])
-                            if len(vectors) != len(batch):
-                                raise ValueError("埋め込みの件数がチャンク数と一致しません。")
-                            rows = []
-                            for number, (chunk, vector) in enumerate(zip(batch, vectors), start):
-                                vector = list(map(float, vector))
-                                if len(vector) != self.config.dimension or not all(__import__("math").isfinite(v) for v in vector):
-                                    raise ValueError("埋め込みの次元数または数値が不正です。")
-                                rows.append({"chunk_id": f"{generation}:{number}", "doc_id": doc_id, "generation": generation,
-                                             "page": chunk["page"], "section": chunk["section"], "title": title,
-                                             "text": chunk["text"], "terms": self.tokenize(chunk["embedding_text"]), "vector": vector})
-                            if stale:
+                            # 索引にはあるが、今の抽出の設定の結果がない（抽出の版を上げた、結果を消したなど）。
+                            # 索引は作り直さず、返す本文のために抽出だけをやり直す。
+                            self._write_markdown(markdown, self.extractor(data, self.config, cache, progress))
+                    else:
+                        skipped = False
+                        if not stale:
+                            connection.execute("INSERT OR IGNORE INTO jobs(generation,doc_id) VALUES (?,?)", (generation, doc_id))
+                            connection.commit()
+                        try:
+                            pages = self.extractor(data, self.config, cache, progress)
+                            title = title.strip() or path.stem
+                            applied = apply_decisions(pages, ledger.decisions(doc_id, upto=review_version)) if review_version else pages
+                            # 却下したページは索引に入れない（却下を書いた 1 行も入れない）
+                            chunks = chunks_for([page for page in applied if page.get("reviewed") != "rejected"], title, self.config)
+                            if not chunks and previous_generation is None and not review_version:
+                                # 最初の取り込みのときだけ失敗にする。確認の結果で検索できる本文がなくなったときは、行が 0 の版を公開する
+                                raise ValueError("検索できるテキストがありません。取り込みは完了していません。")
+                            pages_count, chunks_count = len(pages), len(chunks)
+                            if not markdown.exists():
+                                self._write_markdown(markdown, pages)
+                            self._write_published(folder, doc_id, generation, applied if review_version else None, pages)
+                            if stale and not chunks:
+                                # 検索できる本文がない版（すべて却下した）を、方針が変わった索引に公開する。空にしたあとで、
+                                # この版の途中経過の行を作り直す（_reset_index は途中経過もすべて消す）
                                 self._reset_index(folder, connection, stale)
                                 stale, index_reset = None, True
-                                connection.execute("INSERT OR IGNORE INTO jobs(generation) VALUES (?)", (generation,))
+                                connection.execute("INSERT OR IGNORE INTO jobs(generation,doc_id) VALUES (?,?)", (generation, doc_id))
                                 connection.commit()
-                            if table is None:
-                                table = self._table(folder, create=True)
-                            table.merge_insert("chunk_id").when_matched_update_all().when_not_matched_insert_all().execute(rows)
-                            connection.execute("UPDATE jobs SET completed=?, error=NULL WHERE generation=?", (start + len(batch), generation))
+                            # 方針が変わった索引は、最初のバッチの埋め込みが済んでから空にする。モデルの取得や読み込みに
+                            # 失敗しても、前の索引を壊さない。設定を戻せば、前の索引をそのまま使える。
+                            table = None if stale else self._table(folder, create=True)
+                            completed = 0 if stale else connection.execute(
+                                "SELECT completed FROM jobs WHERE generation=?", (generation,)).fetchone()[0]
+                            for start in range(completed, len(chunks), self.config.batch_size):
+                                if progress:
+                                    progress("埋め込み", start, len(chunks))
+                                batch = chunks[start:start + self.config.batch_size]
+                                vectors = self.embedder.encode([chunk["embedding_text"] for chunk in batch])
+                                if len(vectors) != len(batch):
+                                    raise ValueError("埋め込みの件数がチャンク数と一致しません。")
+                                rows = []
+                                for number, (chunk, vector) in enumerate(zip(batch, vectors), start):
+                                    vector = list(map(float, vector))
+                                    if len(vector) != self.config.dimension or not all(__import__("math").isfinite(v) for v in vector):
+                                        raise ValueError("埋め込みの次元数または数値が不正です。")
+                                    rows.append({"chunk_id": f"{generation}:{number}", "doc_id": doc_id, "generation": generation,
+                                                 "page": chunk["page"], "section": chunk["section"], "title": title,
+                                                 "text": chunk["text"], "terms": self.tokenize(chunk["embedding_text"]), "vector": vector})
+                                if stale:
+                                    self._reset_index(folder, connection, stale)
+                                    stale, index_reset = None, True
+                                    connection.execute("INSERT OR IGNORE INTO jobs(generation,doc_id) VALUES (?,?)", (generation, doc_id))
+                                    connection.commit()
+                                if table is None:
+                                    table = self._table(folder, create=True)
+                                table.merge_insert("chunk_id").when_matched_update_all().when_not_matched_insert_all().execute(rows)
+                                connection.execute("UPDATE jobs SET completed=?, error=NULL WHERE generation=?", (start + len(batch), generation))
+                                connection.commit()
+                                if progress:
+                                    progress("埋め込み", start + len(batch), len(chunks))
+                        except Exception as error:
+                            connection.execute("UPDATE jobs SET status='failed', error=? WHERE generation=?", (str(error), generation))
                             connection.commit()
-                            if progress:
-                                progress("埋め込み", start + len(batch), len(chunks))
-                    except Exception as error:
-                        connection.execute("UPDATE jobs SET status='failed', error=? WHERE generation=?", (str(error), generation))
-                        connection.commit()
-                        raise
-                self._maintain_indexes(folder,self._table(folder),progress)
-                current = os.stat(path)
-                if (stat_after.st_size, stat_after.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
-                    raise ValueError("処理中に PDF が変更されました。新しいジョブで取り込んでください。")
-                if before_publish:
-                    before_publish()
-                # この場所と、同じファイルの別名（ハードリンクなど）の場所が前に指していた文書は、古い版になる。
-                # 別名は公開の直前に調べる。取り込みの途中で別名が差し替えられても、残っている古い版を消さないため。
-                same_file = file_id(stat_after)
-                previous = connection.execute(
-                    "SELECT path,doc_id FROM locations WHERE path=? OR (? IS NOT NULL AND dev=? AND ino=?)",
-                    (location, same_file and 1, *(same_file or (None, None)))).fetchall()
-                aliases, affected, vanished = [], [], []
-                for row in previous:
-                    if row["path"] == location:
-                        affected.append(row)
-                        continue
-                    # 記録した識別子だけでは決めない。今も同じファイルを指しているときだけ別名とみなす。
-                    try:
-                        current = os.stat(row["path"])
-                    except FileNotFoundError:
-                        vanished.append(row)  # もうない別名の行は外す
-                        continue
-                    except OSError:
-                        continue
-                    if file_id(current) == same_file and (current.st_size, current.st_mtime_ns) == (
-                            stat_after.st_size, stat_after.st_mtime_ns):
-                        aliases.append(row["path"])
-                        affected.append(row)
-                old_ids = sorted({row["doc_id"] for row in affected + vanished if row["doc_id"] != doc_id})
-                for row in vanished:
-                    connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
-                # 新しい索引が揃うまでは旧版を検索対象として残す。
-                reviews = {page for old_id in old_ids for page in self._mark_reviews(wiki, connection, old_id)}
-                # 索引を空にしたあとは、この場所の前の版を台帳で引けない。取り込み直しの一覧から引く。
-                for item in self._previous_documents(folder).values():
-                    if item["sha256"] != doc_id and path.as_posix() in item["paths"]:
-                        reviews.update(self._mark_reviews(wiki, connection, item["sha256"], item["source_pages"]))
-                reviews = sorted(reviews)
-                connection.execute("""INSERT OR REPLACE INTO documents
-                    (doc_id,generation,title,pages,chunks,fingerprint,ingested_at)
-                    VALUES (?,?,?,?,?,?,?)""",
-                                   (doc_id, generation, existing["title"] if existing else title,
-                                    pages_count, chunks_count, self.config.fingerprint, time.time()))
-                now = time.time()
-                for place in [location, *aliases]:
-                    connection.execute("INSERT OR REPLACE INTO locations VALUES (?,?,?,?,?,?,?)",
-                                       (place, doc_id, stat_after.st_size, stat_after.st_mtime_ns,
-                                        now if place == location else now - 1e-6, *(same_file or (None, None))))
-                connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, source_page))
-                # 索引を空にする前に、この文書を出典にしていたページも戻す。版が変わったときの要再確認の印に使う。
-                restored = self._previous_documents(folder).get(doc_id)
-                for page in restored["source_pages"] if restored else []:
-                    connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, page))
-                # 改名した同じ内容の資料は、存在しなくなった旧パスだけを台帳から外す。
-                for row in connection.execute("SELECT path FROM locations WHERE doc_id=?", (doc_id,)).fetchall():
-                    if not os.path.exists(row["path"]):
+                            raise
+                    self._maintain_indexes(folder,self._table(folder),progress)
+                    current = os.stat(path)
+                    if (stat_after.st_size, stat_after.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
+                        raise ValueError("処理中に PDF が変更されました。新しいジョブで取り込んでください。")
+                    if before_publish:
+                        before_publish()
+                    # この場所と、同じファイルの別名（ハードリンクなど）の場所が前に指していた文書は、古い版になる。
+                    # 別名は公開の直前に調べる。取り込みの途中で別名が差し替えられても、残っている古い版を消さないため。
+                    same_file = file_id(stat_after)
+                    previous = connection.execute(
+                        "SELECT path,doc_id FROM locations WHERE path=? OR (? IS NOT NULL AND dev=? AND ino=?)",
+                        (location, same_file and 1, *(same_file or (None, None)))).fetchall()
+                    aliases, affected, vanished = [], [], []
+                    for row in previous:
+                        if row["path"] == location:
+                            affected.append(row)
+                            continue
+                        # 記録した識別子だけでは決めない。今も同じファイルを指しているときだけ別名とみなす。
+                        try:
+                            current = os.stat(row["path"])
+                        except FileNotFoundError:
+                            vanished.append(row)  # もうない別名の行は外す
+                            continue
+                        except OSError:
+                            continue
+                        if file_id(current) == same_file and (current.st_size, current.st_mtime_ns) == (
+                                stat_after.st_size, stat_after.st_mtime_ns):
+                            aliases.append(row["path"])
+                            affected.append(row)
+                    old_ids = sorted({row["doc_id"] for row in affected + vanished if row["doc_id"] != doc_id})
+                    for row in vanished:
                         connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
-                connection.execute("UPDATE jobs SET status='complete', error=NULL WHERE generation=?", (generation,))
-                removed = []
-                old_rows = {old_id: connection.execute("SELECT generation FROM documents WHERE doc_id=?", (old_id,)).fetchall()
-                            for old_id in old_ids}
-                for old_id in old_ids:
-                    if not connection.execute("SELECT 1 FROM locations WHERE doc_id=?", (old_id,)).fetchone():
-                        connection.execute("DELETE FROM documents WHERE doc_id=?", (old_id,))
-                        # 内部の途中経過も消す。同じ内容に戻したとき、埋め込みを最初からやり直すため。
-                        # 記録した generation は、抽出の版を上げる前の式のこともあるので、今の式の値と両方を消す。
-                        old_generations = {self.config.generation(old_id), *(row[0] for row in old_rows.get(old_id, []))}
-                        connection.executemany("DELETE FROM jobs WHERE generation=?", [(value,) for value in old_generations])
-                        removed.append((old_id, self._legacy_generations(folder, old_id, None)))
-                connection.commit()
-                # コミット後の保守が失敗しても、新版は検索できる。旧行は active generation の条件で除外する。
-                cleanup_error = None
-                try:
-                    # 取り込み直しの一覧から、取り込み直した文書と置き換えられた文書を外す。すべて外れたら一覧を消す。
-                    self._prune_previous(folder, connection)
+                    # 新しい索引が揃うまでは旧版を検索対象として残す。
+                    reviews = {page for old_id in old_ids for page in self._mark_reviews(wiki, connection, old_id)}
+                    # 索引を空にしたあとは、この場所の前の版を台帳で引けない。取り込み直しの一覧から引く。
+                    for item in self._previous_documents(folder).values():
+                        if item["sha256"] != doc_id and path.as_posix() in item["paths"]:
+                            reviews.update(self._mark_reviews(wiki, connection, item["sha256"], item["source_pages"]))
+                    reviews = sorted(reviews)
+                    # 新しい版の行をすべて書いたあとで、公開する generation と確認の版を切りかえる。前の版の途中経過も消す
+                    connection.execute("""INSERT OR REPLACE INTO documents
+                        (doc_id,generation,title,pages,chunks,fingerprint,ingested_at,review_version)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                                       (doc_id, generation, existing["title"] if existing else title,
+                                        pages_count, chunks_count, self.config.fingerprint, time.time(), review_version))
+                    # 同じ文書のほかの版の途中経過を消す（途中で止まった、まだ公開していない版のものも）。前の式の行には
+                    # 文書の列がないので、前に公開していた generation でも消す
+                    connection.execute("DELETE FROM jobs WHERE doc_id=? AND generation!=?", (doc_id, generation))
+                    if previous_generation and previous_generation != generation:
+                        connection.execute("DELETE FROM jobs WHERE generation=?", (previous_generation,))
+                    now = time.time()
+                    for place in [location, *aliases]:
+                        connection.execute("""INSERT OR REPLACE INTO locations (path,doc_id,size,mtime_ns,confirmed_at,dev,ino,source)
+                            VALUES (?,?,?,?,?,?,?,?)""",
+                                           (place, doc_id, stat_after.st_size, stat_after.st_mtime_ns,
+                                            now if place == location else now - 1e-6, *(same_file or (None, None)),
+                                            self.config.pdf_source(source) if place == location else None))
+                    connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, source_page))
+                    # 索引を空にする前に、この文書を出典にしていたページも戻す。版が変わったときの要再確認の印に使う。
+                    restored = self._previous_documents(folder).get(doc_id)
+                    for page in restored["source_pages"] if restored else []:
+                        connection.execute("INSERT OR IGNORE INTO citations VALUES (?,?)", (doc_id, page))
+                    # 改名した同じ内容の資料は、存在しなくなった旧パスだけを台帳から外す。
+                    for row in connection.execute("SELECT path FROM locations WHERE doc_id=?", (doc_id,)).fetchall():
+                        if not os.path.exists(row["path"]):
+                            connection.execute("DELETE FROM locations WHERE path=?", (row["path"],))
+                    connection.execute("UPDATE jobs SET status='complete', error=NULL WHERE generation=?", (generation,))
+                    removed = []
+                    old_rows = {old_id: connection.execute("SELECT generation FROM documents WHERE doc_id=?", (old_id,)).fetchall()
+                                for old_id in old_ids}
+                    for old_id in old_ids:
+                        if not connection.execute("SELECT 1 FROM locations WHERE doc_id=?", (old_id,)).fetchone():
+                            connection.execute("DELETE FROM documents WHERE doc_id=?", (old_id,))
+                            # 内部の途中経過も消す。同じ内容に戻したとき、埋め込みを最初からやり直すため。
+                            # 記録した generation は、抽出の版を上げる前の式のこともあるので、今の式の値と両方を消す。
+                            old_generations = {self.config.generation(old_id), *(row[0] for row in old_rows.get(old_id, []))}
+                            connection.executemany("DELETE FROM jobs WHERE generation=?", [(value,) for value in old_generations])
+                            # 確認の版の途中経過（まだ公開していない版のものも）を、文書で消す
+                            connection.execute("DELETE FROM jobs WHERE doc_id=?", (old_id,))
+                            removed.append((old_id, self._legacy_generations(folder, old_id, None)))
+                    connection.commit()
+                    # コミット後の保守が失敗しても、新版は検索できる。旧行は active generation の条件で除外する。
+                    cleanup_error = None
+                    try:
+                        # 取り込み直しの一覧から、取り込み直した文書と置き換えられた文書を外す。すべて外れたら一覧を消す。
+                        self._prune_previous(folder, connection)
+                    except Exception as error:
+                        cleanup_error = str(error)
+                    for item in (folder / "reviewed" / doc_id).glob("*"):
+                        if item.is_dir() and item.name != generation:
+                            shutil.rmtree(item, ignore_errors=True)
+                    for old_id, _ in removed:
+                        shutil.rmtree(folder / "reviewed" / old_id, ignore_errors=True)
+                    if previous_generation and previous_generation != generation:
+                        # 同じ文書の前の版の行を消す。検索は公開した generation だけを返すので、消す前でも混ざらない
+                        try:
+                            table = self._table(folder)
+                            if table is not None:
+                                table.delete(f"doc_id = '{doc_id}' AND generation != '{generation}'")
+                                self._maintain_indexes(folder, table)
+                        except Exception as error:
+                            cleanup_error = str(error)
+                    for old_id, legacy_generations in removed:
+                        try:
+                            table = self._table(folder)
+                            if table is not None:
+                                table.delete(f"doc_id = '{old_id}'")
+                                self._maintain_indexes(folder, table)
+                        except Exception as error:
+                            cleanup_error = str(error)
+                        try:
+                            # 抽出の結果は、同じ data_dir のどの wiki も使わなくなったときだけ消す（ADR-0014）。
+                            self._remove_extraction(old_id)
+                            # 0.4.0 がこの wiki に置いたまま移していない結果も消す。
+                            self._remove_legacy_extraction(folder, legacy_generations)
+                        except Exception as error:
+                            cleanup_error = str(error)
+                    return {"status": "unchanged" if skipped else "indexed", "document_id": doc_id,
+                            "raw": path.as_posix(), "sha256": doc_id, "pages": pages_count, "chunks": chunks_count,
+                            "extracted_markdown": str(reviewed_markdown or markdown), "source_page": source_page,
+                            "review": {"ledger_version": ledger.version(doc_id), "published_version": review_version},
+                            "review_pages": reviews, "cleanup_error": cleanup_error, "index_reset": index_reset,
+                            "indexes":json.loads((folder/'index-state.json').read_text(encoding='utf-8'))
+                                if (folder/'index-state.json').exists() else None,
+                            # ページの情報と抽出の識別（ADR-0025）。一覧は Jobs.status が 200 個ずつに切って返す
+                            "page_report": page_report(data, self.config, cache),
+                            "extraction": text_layer_identity()}
                 except Exception as error:
-                    cleanup_error = str(error)
-                for old_id, legacy_generations in removed:
+                    # 失敗したときも、それまでに判定と抽出を済ませたページの情報を返す（ADR-0025）。
                     try:
-                        self._table(folder).delete(f"doc_id = '{old_id}'")
-                        self._maintain_indexes(folder,self._table(folder))
-                    except Exception as error:
-                        cleanup_error = str(error)
-                    try:
-                        # 抽出の結果は、同じ data_dir のどの wiki も使わなくなったときだけ消す（ADR-0014）。
-                        self._remove_extraction(old_id)
-                        # 0.4.0 がこの wiki に置いたまま移していない結果も消す。
-                        self._remove_legacy_extraction(folder, legacy_generations)
-                    except Exception as error:
-                        cleanup_error = str(error)
-                return {"status": "unchanged" if skipped else "indexed", "document_id": doc_id,
-                        "raw": path.as_posix(), "sha256": doc_id, "pages": pages_count, "chunks": chunks_count,
-                        "extracted_markdown": str(markdown), "source_page": source_page,
-                        "review_pages": reviews, "cleanup_error": cleanup_error, "index_reset": index_reset,
-                        "indexes":json.loads((folder/'index-state.json').read_text(encoding='utf-8'))}
+                        error.page_report = page_report(data, self.config, cache)
+                    except Exception:
+                        pass
+                    raise
+
+    def rebuild_reviewed(self, wiki_root: str, doc_id: str, progress=None, before_publish=None) -> dict:
+        """台帳の最新の確認の版を当てて、その wiki の索引を作り直す（ADR-0025 の「作り直しのジョブ」）。
+
+        いつも取り込みと同じ ingest_pdf を通す。公開した版が台帳の版と同じなら、ingest_pdf は取り込み済みの分岐で、
+        公開している版の本文と page_report をそのまま返す（何もしないときも、結果は欠けない）。作り直したあとで台帳の
+        版が新しくなっていれば（作り直しの途中で確認を受け付けた）、続けてもう一度作り直す。方針が変わった索引は
+        空にしない（取り込み直しのときに当てる）。
+        """
+        wiki = Path(wiki_root).expanduser().resolve()
+        folder = self.config.workspace(str(wiki))
+        ledger = Ledger(folder)
+        for _ in range(100):
+            with self._catalog(folder) as connection:
+                row = connection.execute("SELECT * FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+                if row is None:
+                    raise ValueError("この wiki の索引に、確認した PDF がありません。PDF を取り込み直してください。")
+                place = self._location(connection, doc_id)
+                if place is not None:
+                    # 利用者が渡したままのパスがあれば、それを使う（ネットワークドライブの PDF の解決したパスは UNC になる）
+                    given = connection.execute("SELECT source FROM locations WHERE path=?", (place,)).fetchone()
+                    place = given[0] if given and given[0] else place
+                cited = connection.execute("SELECT source_page FROM citations WHERE doc_id=? ORDER BY source_page",
+                                           (doc_id,)).fetchone()
+            if place is None or cited is None:
+                raise ValueError("確認した PDF が、取り込んだ場所にありません（移したか、変えた）。PDF を取り込み直してください。")
+            result = self.ingest_pdf(str(wiki), place, cited[0], row["title"], progress, before_publish,
+                                     expected_doc_id=doc_id, allow_reset=False)
+            if result["status"] == "deferred" or result["review"]["published_version"] >= ledger.version(doc_id):
+                return result
+        raise RuntimeError("確認の結果を当てる作り直しが、100 回続けても台帳の版に追いつきませんでした。")
+
+    def _review_marks(self, folder: Path, documents: dict) -> dict:
+        """文書ごとに、公開した版での確認の状態の印を作る関数を返す材料。検索のたびに読む（印は索引に入れない）。"""
+        ledger = Ledger(folder)
+        marks = {}
+        for doc_id, row in documents.items():
+            summary = load_summary(folder, doc_id, row["generation"])
+            if not summary:
+                continue
+            snapshot = ledger.state(doc_id, row.get("review_version") or 0)  # 1 回の読み取り
+            marks[doc_id] = (summary, snapshot["published"], snapshot["latest"])
+        return marks
+
+    def _mark(self, marks: dict, doc_id: str, page: int) -> dict | None:
+        found = marks.get(doc_id)
+        if not found:
+            return None
+        summary, published, latest = found
+        entry = summary.get(int(page))
+        if entry is None:
+            return None
+        state = page_state(entry, published.get(int(page)), self.config.ocr_confidence_threshold)
+        newer = latest.get(int(page))
+        awaiting = newer is not None and (published.get(int(page)) is None or newer["version"] != published[int(page)]["version"])
+        if not state and not awaiting:
+            return None
+        return {"state": state, "awaiting_publish": awaiting}
 
     def search(self, wiki_root: str, query: str, limit: int = 10) -> dict:
         if not query.strip() or not 1 <= limit <= 50:
@@ -679,6 +845,8 @@ class Engine:
                     return empty
                 active = "generation IN (" + ",".join("'" + row["generation"] + "'" for row in documents.values()) + ")"
                 table = self._table(folder)
+                if table is None:
+                    return empty  # 公開している版がどれも行を持たない（すべてのページを却下した）
                 vector = self.embedder.encode([query], query=True)[0].tolist()
                 candidates = max(limit, min(200, limit * 10))
                 columns = ["chunk_id", "doc_id", "page", "section", "title", "text"]
@@ -706,6 +874,7 @@ class Engine:
                     if self.config.min_rerank_score is not None:
                         ranked = [key for key in ranked if key in reranked_scores and reranked_scores[key] >= self.config.min_rerank_score]
                 results = []
+                marks = self._review_marks(folder, documents)
                 for key in ranked[:limit]:
                     row = rows[key]
                     found = self._location(connection, row["doc_id"])
@@ -713,7 +882,9 @@ class Engine:
                     results.append({**{k: v for k, v in row.items() if not k.startswith("_")}, "score": scores[key],
                                     "raw": Path(found).as_posix() if found else None, "sha256": row["doc_id"],
                                     "source_pages": sources,
-                                    "rerank_score": reranked_scores.get(key)})
+                                    "rerank_score": reranked_scores.get(key),
+                                    # 確認待ちのページと、確認の結果が反映待ちのページの印（ADR-0025）
+                                    "review": self._mark(marks, row["doc_id"], row["page"])})
                 return {"results": results, "model": self.config.model, "reranker":self.config.reranker,
                         "abstained":not results and self.config.min_rerank_score is not None}
 
@@ -721,13 +892,36 @@ class Engine:
         folder = self.config.workspace(wiki_root)
         if not (folder / "catalog.sqlite").exists():
             return {"documents": 0, "chunks": 0, "jobs": [], "data_dir": str(folder),
-                    "reingest_required": False, "reingest": []}
+                    "reingest_required": False, "reingest": [],
+                    "review": {"pending_pages": 0, "awaiting_publish_pages": 0, "documents": [],
+                               "threshold": self.config.ocr_confidence_threshold}}
         with self._catalog(folder) as connection:
             counts = connection.execute("SELECT COUNT(*),COALESCE(SUM(chunks),0) FROM documents").fetchone()
             jobs = [dict(row) for row in connection.execute("SELECT generation,completed,status,error FROM jobs WHERE status != 'complete'")]
             index_state=folder/'index-state.json'
             # 設定が変わった索引の文書と、空にしたあとまだ取り込み直していない文書（ADR-0014）。
             reingest = self._reingest(folder, connection)
+            documents = {row["doc_id"]: dict(row) for row in connection.execute("SELECT * FROM documents")}
             return {"documents": counts[0], "chunks": counts[1], "jobs": jobs, "data_dir": str(folder),
                     "indexes":json.loads(index_state.read_text(encoding='utf-8')) if index_state.exists() else None,
-                    "reingest_required": bool(reingest), "reingest": reingest}
+                    "reingest_required": bool(reingest), "reingest": reingest,
+                    "review": self._review_status(folder, documents)}
+
+    def _review_status(self, folder: Path, documents: dict) -> dict:
+        """wiki ごとの確認待ちのページの数と、反映待ちのページの数（ADR-0025 の「答えがないとき」）。"""
+        ledger = Ledger(folder)
+        found = []
+        for doc_id, row in documents.items():
+            summary = load_summary(folder, doc_id, row["generation"])
+            if not summary:
+                continue
+            snapshot = ledger.state(doc_id, row["review_version"])  # 1 回の読み取り
+            lists = review_lists(summary, snapshot["latest"], snapshot["published"], self.config.ocr_confidence_threshold)
+            pending = len(lists["review:pending"]) + len(lists["review:stale"])
+            awaiting = len(lists["review:awaiting_publish"])
+            if pending or awaiting:
+                found.append({"sha256": doc_id, "title": row["title"], "pending_pages": pending, "awaiting_publish_pages": awaiting,
+                              "ledger_version": snapshot["version"], "published_version": row["review_version"]})
+        return {"pending_pages": sum(item["pending_pages"] for item in found),
+                "awaiting_publish_pages": sum(item["awaiting_publish_pages"] for item in found), "documents": found,
+                "threshold": self.config.ocr_confidence_threshold}
