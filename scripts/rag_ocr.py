@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["ndlocr-lite @ git+https://github.com/ndl-lab/ndlocr-lite@e57f7c6bd9cfb3de5f12f008e71ad2122bd44bfd"]
+# dependencies = ["ndlocr-lite @ git+https://github.com/ndl-lab/ndlocr-lite@e57f7c6bd9cfb3de5f12f008e71ad2122bd44bfd", "rapidocr==3.10.0"]
 # ///
 """NDLOCR-Lite を初回の OCR 時に取得して CPU で実行する。"""
 
@@ -41,6 +41,9 @@ def serve(threads: int,device: str='cpu'):
         rec_classes=str(package/'config/NDLmoji.yaml'),enable_tcy=False)
     models=None
     evidence=None
+    blurred={}
+    rapids={}
+    blur_wanted=[False]
     class BoundedRecognizer:
         def __init__(self,model,gate): self.model,self.gate=model,gate
         def read(self,image):
@@ -79,13 +82,41 @@ def serve(threads: int,device: str='cpu'):
                             if not cuda_events: raise RuntimeError(f'{name} の GPU 実行を確認できませんでした。')
                             evidence[name]={'cuda_node_events':cuda_events,'profile':str(path),'providers':model.session.get_providers()}
                     gate=threading.BoundedSemaphore(threads)
-                    models=(detector,*[BoundedRecognizer(model,gate) for model in recognizers])
+                    # 文字ごとの確率も受け取る（ADR-0025）。セッションを作り直したあとで包む
+                    from rag_ocr_confidence import ConfidentRecognizer, blur_text, rapid_reader
+                    rapid=rapid_reader()
+                    models=(detector,*[BoundedRecognizer(ConfidentRecognizer(model),gate) for model in recognizers])
+                    # 行の印の「ぼかした読み」（ADR-0025）。process_cascade のあとに、行の画像ごとに読む。
+                    # NDLOCR-Lite のファイルは変えず、モジュールの関数を包む
+                    original_cascade=ocr.process_cascade
+                    def cascade(alllineobj,recognizer30,recognizer50,recognizer100,is_cascade=True):
+                        results=original_cascade(alllineobj,recognizer30,recognizer50,recognizer100,is_cascade=is_cascade)
+                        blurred.clear()
+                        rapids.clear()
+                        if blur_wanted[0]:
+                            for lineobj in alllineobj:
+                                blurred[lineobj.idx]=blur_text(recognizer100,lineobj.npimg)
+                                rapids[lineobj.idx]=rapid(lineobj.npimg)
+                        return results
+                    ocr.process_cascade=cascade
                 image=Path(request['image'])
+                blur_wanted[0]=bool(request.get('blur'))
                 with Image.open(image) as original:
                     pixels=np.array(original.convert('RGB'))
                 result=ocr._run_ocr_on_image_array(*models,image.name,pixels,str(image.parent),save_viz=False)
+            from rag_ocr_confidence import BLUR_REVISION, CONFIDENCE_REVISION, RAPID_REVISION, line_records
+            records=line_records(result['json_lines'])
+            if blur_wanted[0]:
+                for index,record in enumerate(records):
+                    record['blur_text']=blurred.get(index)
+                    record['rapid_text']=rapids.get(index)
             answer={'ok':True,'text':result['text'].strip(),'line_count':result['line_count'],
-                    'vertical_line_count':result['vertical_line_count'],'pid':os.getpid(),'device':device}
+                    'vertical_line_count':result['vertical_line_count'],'pid':os.getpid(),'device':device,
+                    # 行ごとの本文、文字と終わりの記号の確率、行の確信度、検出器の confidence（ADR-0025）
+                    'lines':records,'confidence_revision':CONFIDENCE_REVISION}
+            if blur_wanted[0]:
+                answer['blur_revision']=BLUR_REVISION
+                answer['rapid_revision']=RAPID_REVISION
             if evidence:
                 answer['gpu_execution']=evidence
                 evidence=None

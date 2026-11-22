@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "mcp>=1.28,<2", "lancedb>=0.25,<0.30", "pypdfium2>=5,<6",
+#   "mcp>=1.28,<2", "lancedb>=0.25,<0.30", "pypdfium2==5.15.2", "pdfminer.six==20260107",
 #   "sentence-transformers>=5,<6", "sudachipy>=0.6,<0.8", "sudachidict-core",
 #   "pyyaml>=6,<7", "filelock>=3,<5", "psutil>=7,<8", "torch==2.8.0", "numpy>=2,<3", "pillow>=11,<14", "onnxruntime>=1.31,<2",
 # ]
@@ -135,16 +135,52 @@ def ingest_pdf(wiki_root: str, source: str, source_page: str, title: str = "") -
 
 
 @server.tool()
-async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0) -> dict:
-    """進捗と完了時の抽出 Markdown を返す。wait_seconds=1〜30 で完了を短時間待てる。"""
+async def job_status(wiki_root: str, job_id: str, wait_seconds: int = 0, page_report_from: int = 0) -> dict:
+    """進捗と完了時の抽出 Markdown を返す。wait_seconds=1〜30 で完了を短時間待てる。
+    result.page_report は、判定ごとのページ、確かめるべきページ、OCR したページ、OCR の結果が空のページを、
+    続いた番号の範囲で返す（失敗したジョブでも、それまでのページの分を返す）。範囲の数が 200 を超える一覧は
+    next に位置が入るので、page_report_from にその位置を渡して続きを取る。"""
     if not 0 <= wait_seconds <= 30:
         raise ValueError("wait_seconds は 0〜30 にしてください。")
+    if page_report_from < 0:
+        raise ValueError("page_report_from は 0 以上にしてください。")
     deadline = time.monotonic() + wait_seconds
     while True:
-        result = jobs().status(wiki_root, job_id)
+        result = jobs().status(wiki_root, job_id, page_report_from, configuration().ocr_confidence_threshold)
         if result["status"] in {"completed", "failed", "cancelled"} or time.monotonic() >= deadline:
             return result
         await asyncio.sleep(.1)
+
+
+@server.tool()
+def ocr_page_detail(wiki_root: str, job_id: str, page: int) -> dict:
+    """完了した取り込みのジョブの、OCR したページの詳しいことを返す（ADR-0025）。OCR の本文、その SHA-256、
+    印の付いた行（flagged_lines。行の番号、本文、印の理由 reasons（low: 確信度が閾値より低い、blur: ぼかした読みと違う、
+    alt: 別の解像度の読みと違い確信度が 0.9 未満、rapid: 別の認識器の読みが英数字か記号を足すか置き換えた）、
+    ぼかした読み blur_text、別の解像度の読み alt_text、別の認識器の読み rapid_text、確信度、ページの中の位置）、
+    今の確認の結果と履歴、台帳の確認の版、公開した確認の版。
+    OCR の本文は共有の抽出の結果から返すので、直したり却下したりしたあとでも、元の OCR の本文が分かる。"""
+    from rag_review import page_detail
+    doc_id = jobs().completed_document(wiki_root, job_id)
+    return page_detail(configuration(), wiki_root, doc_id, page)
+
+
+@server.tool()
+def decide_ocr_pages(wiki_root: str, job_id: str, base_version: int, decisions: list[dict]) -> dict:
+    """OCR の印の付いた行があるページの確認の結果を受け付ける（ADR-0025）。decisions はページごとに
+    {"page", "action": accept / fix / reject, "text"（fix のとき、直した本文）, "decided_by": user / agent_draft_approved,
+    "ocr_sha256"（ocr_page_detail で確かめた OCR の本文の SHA-256）}。base_version は、もとにした台帳の確認の版
+    （ocr_page_detail の ledger_version）。台帳の版か SHA-256 が今と違えば受け付けない。受け付けたら台帳の版を上げ、
+    その wiki の本文と索引を作り直すジョブを登録して返す。反映は rebuild_job を job_status で確かめる。"""
+    from rag_review import decide
+    with _lock:
+        doc_id = jobs().completed_document(wiki_root, job_id)
+        version = decide(configuration(), wiki_root, doc_id, base_version, decisions)
+        # この版を受け持つ作り直しのジョブを登録する。台帳に書いたあと、ここまでに止まっても、ワーカーが状態から登録し直す。
+        # ワーカーが先に登録していれば（取り消されていても）、そのジョブを返す
+        rebuild = jobs().register_rebuild(configuration(), wiki_root, doc_id, version) \
+            or jobs().rebuild_for(wiki_root, doc_id, version)
+    return {"ledger_version": version, "rebuild_job": rebuild}
 
 
 @server.tool()
@@ -179,8 +215,11 @@ async def search(wiki_root: str, query: str, limit: int = 10) -> dict:
 
 @server.tool()
 def status(wiki_root: str) -> dict:
-    """取り込み済みの件数と、中断・失敗した処理を確認する。"""
+    """取り込み済みの件数と、中断・失敗した処理を確認する。settings に今の OCR の設定（ocr_mode、ocr_dpi）を返す。"""
     result = engine().status(wiki_root)
+    current = configuration()
+    result["settings"] = {"ocr_mode": current.ocr_mode, "ocr_dpi": current.ocr_dpi,
+                          "ocr_confidence_threshold": current.ocr_confidence_threshold}
     result["index_jobs"] = result.pop("jobs")
     result["jobs"] = jobs().list(wiki_root)
     legacy = jobs().legacy_data()

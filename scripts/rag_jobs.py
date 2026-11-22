@@ -10,6 +10,8 @@ import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from filelock import FileLock
+
 from rag_config import Config
 
 
@@ -23,7 +25,9 @@ class Jobs:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         # 0.3.0 の jobs.sqlite は開かない（ADR-0013）。
         self.path = self.data_dir / "jobs-v2.sqlite"
-        with self.connect() as db:
+        # 台帳の作成と前の版からの移行を、プロセスをまたいで 1 本ずつ通す。同じ台帳を 2 つ以上の接続が同時に開くと、
+        # WAL への切り替え（busy_timeout が効かないことがある）と、列の一覧を読んでから列を足す段が競合する（PR #12）
+        with FileLock(str(self.data_dir / "jobs-v2.init.lock"), timeout=60), self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS ingest_jobs (
@@ -42,6 +46,16 @@ class Jobs:
                     status TEXT NOT NULL DEFAULT 'queued', result TEXT, error TEXT,
                     updated_at REAL NOT NULL);
             """)
+            # rag 0.6.0 で、確認を当てる作り直しのジョブ（kind='review'）を足した（ADR-0025）。前の版の台帳には列を足す。
+            # 列の一覧を読んでから列を足すまでを、書き込みのトランザクションでも守る（上のロックを使わずに台帳を
+            # 開く古い版のプロセスがあっても、"duplicate column name" で止まらないように）
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(ingest_jobs)")}
+            for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'ingest'"), ("doc_id", "TEXT"),
+                                      ("rerun", "INTEGER NOT NULL DEFAULT 0"), ("review_version", "INTEGER"),
+                                      ("queued_at", "REAL")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE ingest_jobs ADD COLUMN {name} {declaration}")
 
     @contextmanager
     def connect(self):
@@ -79,21 +93,151 @@ class Jobs:
                      json.dumps(config.snapshot(), ensure_ascii=False), now, now, request_key, str(stat.st_dev), str(stat.st_ino)))
         return self.status(str(wiki), identity)
 
-    def status(self, wiki_root: str, job_id: str) -> dict:
+    def register_rebuild(self, config: Config, wiki_root: str, doc_id: str, version: int) -> dict | None:
+        """台帳の版 version を受け持つ、確認の結果を当てる作り直しのジョブを登録する（ADR-0025）。wiki と PDF ごとに 1 つ。
+
+        ジョブの行が、受け持つ台帳の版（review_version）を持つ。確かめることと登録することを、ジョブの DB の 1 つの
+        トランザクションで行う。取り込みのジョブの重複の除き方（request_key）は使わない。
+
+        - 同じ wiki と PDF の作り直しが待っていれば、それに version を受け持たせて返す（始めるときに台帳の最新の版を読む）。
+        - 処理中なら rerun の印も付け、終わったときにもう一度待ちに戻す（処理中に受け付けた確認を取りこぼさない）。
+        - version を受け持ったジョブが、状態によらず（取り消し、失敗、完了を含めて）あれば、登録せずに None を返す。
+          確認を受け付けた側と、状態からの登録し直しの、どちらが先に登録しても、同じ版を 2 度登録しない。取り消したジョブと
+          失敗したジョブを、利用者の明示的な再試行なしに復活させない。受け持ったジョブは rebuild_for で引ける。
+        """
+        wiki = Path(wiki_root).expanduser().resolve()
+        config.workspace(str(wiki))
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("""SELECT 1 FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
+                    AND review_version>=? LIMIT 1""", (str(wiki), doc_id, int(version))).fetchone():
+                return None
+            row = db.execute("""SELECT id,status FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=?
+                AND status IN ('queued','running','paused') ORDER BY created_at DESC LIMIT 1""", (str(wiki), doc_id)).fetchone()
+            if row:
+                identity = row["id"]
+                db.execute("UPDATE ingest_jobs SET review_version=MAX(COALESCE(review_version,0),?),updated_at=? WHERE id=?",
+                           (int(version), now, identity))
+                if row["status"] == "running":
+                    db.execute("UPDATE ingest_jobs SET rerun=1,updated_at=? WHERE id=?", (now, identity))
+            else:
+                identity = uuid.uuid4().hex
+                db.execute("""INSERT INTO ingest_jobs
+                    (id,wiki,source,source_page,title,size,mtime_ns,config,created_at,updated_at,request_key,kind,doc_id,phase,
+                     review_version)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (identity, str(wiki), "", "", "", 0, 0, json.dumps(config.snapshot(), ensure_ascii=False), now, now,
+                     "review:" + identity, "review", doc_id, "確認の結果を当てる作り直しを受付", int(version)))
+        return self.status(str(wiki), identity)
+
+    def rebuild_for(self, wiki_root: str, doc_id: str, version: int) -> dict | None:
+        """台帳の版 version を受け持った、いちばん新しい作り直しのジョブ。"""
+        wiki = str(Path(wiki_root).expanduser().resolve())
+        with self.connect() as db:
+            row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND review_version>=?
+                ORDER BY created_at DESC LIMIT 1""", (wiki, doc_id, int(version))).fetchone()
+        return self.status(wiki, row[0]) if row else None
+
+    def status(self, wiki_root: str, job_id: str, page_report_from: int = 0, threshold: float | None = None) -> dict:
+        """ジョブの状態を返す。結果の page_report の一覧は、page_report_from の位置から 200 個の範囲を返す。
+
+        page_report の確認の状態（印の付いた行があるページ、確認待ち、反映待ちなど）は、返すときに、その wiki の台帳と
+        公開した版から作る。threshold を省くと、ジョブを登録したときの設定の閾値を使う。
+        """
         wiki = str(Path(wiki_root).expanduser().resolve())
         with self.connect() as db:
             row = db.execute("SELECT * FROM ingest_jobs WHERE id=? AND wiki=?", (job_id, wiki)).fetchone()
         if row is None:
             raise ValueError("この wiki に指定のジョブがありません。")
         result = dict(row)
+        job_config = json.loads(result["config"])
         result.pop("config")
+        result.pop("rerun", None)
         result.pop("owner")
         result.pop("request_key")
         result.pop("dev")
         result.pop("ino")
         result["job_id"] = result.pop("id")
         result["result"] = json.loads(result["result"]) if result["result"] else None
+        if result["result"] and result["result"].get("page_report"):
+            from rag_pdf import render_page_report
+            report = result["result"]["page_report"]
+            if threshold is None:
+                threshold = Config(job_config).ocr_confidence_threshold
+            report = self._with_review(report, job_config, wiki, result["result"].get("sha256") or result.get("doc_id"),
+                                       threshold)
+            result["result"]["page_report"] = render_page_report(report, page_report_from)
+            review = report.get("review", {})
+            if review.get("extracted_markdown"):
+                # 確認を当てた本文は、公開している版のものを返す（前の版の本文は、次の版を公開したときに消える）
+                result["result"]["extracted_markdown"] = review["extracted_markdown"]
+            if review.get("indexed"):
+                # 本文に付ける確認の版も、公開している版の値にする
+                result["result"]["review"] = {"ledger_version": review["ledger_version"],
+                                              "published_version": review["published_version"]}
         return result
+
+    @staticmethod
+    def _with_review(report: dict, job_config: dict, wiki: str, doc_id: str | None, threshold: float) -> dict:
+        """page_report に、印の付いた行があるページと確認の状態を足す（ADR-0025 の「状態の表示」）。"""
+        from rag_config import OCR_CONFIDENCE_THRESHOLD_CALIBRATED
+        from rag_ocr_flags import OCR_FLAG_REVISION
+        from rag_pdf_layer import page_ranges
+        from rag_review import Ledger, load_summary, published_documents, published_folder, review_lists
+        confidence = report.get("confidence") or {}
+        # 確認の状態は、ジョブを保存したときの記録ではなく、その wiki で今公開している版の要約から作る
+        # （OCR をやり直して本文が変わったあとも、公開している版の状態を返す）。文書がその wiki の索引になければ、
+        # ジョブの記録の確信度だけを使い、確認の状態は返さない
+        summary = {int(page): entry for page, entry in confidence.get("pages", {}).items()}
+        published_version, ledger_version, ledger_decisions, published_decisions, published = 0, 0, {}, {}, None
+        if doc_id:
+            folder = Config(job_config).workspace(wiki)
+            # 公開している generation を読んでから要約を読むあいだに、次の版の公開と前の版の後始末が入ると、要約が消える。
+            # generation を読み直し、要約と同じ時点のものだけを使う。前のジョブの記録の要約には戻らない（OCR の本文が
+            # 変わったあとに、古くなった確認を当たっていると誤って示すため）
+            published, loaded = None, None
+            for _ in range(5):
+                published = published_documents(folder).get(doc_id)
+                if not published:
+                    break
+                loaded = load_summary(folder, doc_id, published["generation"])
+                if loaded is not None or published_documents(folder).get(doc_id) == published:
+                    break
+            snapshot = Ledger(folder).state(doc_id, published["review_version"] if published else 0)
+            ledger_version = snapshot["version"]
+            if published:
+                published_version = published["review_version"]
+                summary = loaded if loaded is not None else {}  # 要約がない版では、確認の状態を返さない
+                ledger_decisions, published_decisions = snapshot["latest"], snapshot["published"]
+        lists = dict(report["lists"])
+        for name, numbers in review_lists(summary, ledger_decisions, published_decisions, threshold).items():
+            lists[name] = {"count": len(numbers), "ranges": page_ranges(numbers)}
+        markdown = None
+        if published:
+            reviewed = published_folder(folder, doc_id, published["generation"]) / "document.md"
+            markdown = str(reviewed) if published_version and reviewed.exists() else None
+        return {**report, "lists": lists,
+                "review": {"ledger_version": ledger_version, "published_version": published_version,
+                           "indexed": bool(published),
+                           # 確認を当てた本文（公開している版）。確認の結果がなければ None（ジョブの extracted_markdown を読む）
+                           "extracted_markdown": markdown},
+                "confidence": {"revision": confidence.get("revision"), "threshold": threshold,
+                               "threshold_calibrated": OCR_CONFIDENCE_THRESHOLD_CALIBRATED,
+                               # 行の印の決め方の版（ADR-0025 の「行の印」）。確認が要るページは、印の付いた行で決まる
+                               "flag_revision": OCR_FLAG_REVISION}}
+
+    def completed_document(self, wiki_root: str, job_id: str) -> str:
+        """完了した取り込みのジョブの PDF の SHA-256 を返す。失敗したジョブと作り直しのジョブは受け付けない。"""
+        wiki = str(Path(wiki_root).expanduser().resolve())
+        with self.connect() as db:
+            row = db.execute("SELECT status,result,kind FROM ingest_jobs WHERE id=? AND wiki=?", (job_id, wiki)).fetchone()
+        if row is None:
+            raise ValueError("この wiki に指定のジョブがありません。")
+        result = json.loads(row["result"]) if row["result"] else {}
+        if row["status"] != "completed" or not result.get("sha256"):
+            raise ValueError("完了した取り込みのジョブを指定してください（失敗したジョブには、確かめる OCR の本文がありません）。")
+        return result["sha256"]
 
     def list(self, wiki_root: str) -> list[dict]:
         wiki = str(Path(wiki_root).expanduser().resolve())
@@ -160,7 +304,10 @@ class Jobs:
     def claim(self, owner: str) -> dict | None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM ingest_jobs WHERE status IN ('queued','paused') ORDER BY created_at LIMIT 1").fetchone()
+            # 待ちに入った順に取る。rerun と再試行で待ちに戻ったジョブは、戻った時点で列の最後に並ぶ（同じ文書に確認が
+            # 続いても、ほかの文書の作り直しと取り込みを追い越し続けない。ADR-0025）
+            row = db.execute("""SELECT * FROM ingest_jobs WHERE status IN ('queued','paused')
+                ORDER BY COALESCE(queued_at, created_at), created_at LIMIT 1""").fetchone()
             if row is None:
                 return None
             db.execute("UPDATE ingest_jobs SET status='running',phase='開始',owner=?,attempts=attempts+1,error=NULL,updated_at=? WHERE id=?",
@@ -185,9 +332,30 @@ class Jobs:
 
     def finish(self, identity: str, owner: str, *, result=None, error=None):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if error is None and isinstance(result, dict):
+                # 作り直しのジョブが受け持つ台帳の版を、実際に公開した版に合わせる。何もせずに終わった（deferred）なら
+                # 手放す（NULL）。受け持ったまま完了すると、公開していない版を二度と登録しなくなる
+                published = (result.get("review") or {}).get("published_version")
+                # 自分が持つ処理中のジョブだけを変える（完了を書く前に取り消されたジョブの受け持つ版は変えない）
+                db.execute("""UPDATE ingest_jobs SET review_version=? WHERE id=? AND owner=? AND status='running'
+                    AND kind='review' AND rerun=0""",
+                           (None if result.get("status") == "deferred" else published, identity, owner))
+            # 作り直しの処理中に次の確認を受け付けていたら、終えずに待ちに戻す（ADR-0025 の「作り直しのジョブ」）
+            # queued_at には今の時刻を別に渡す（SQLite の UPDATE の右辺は更新前の行で評価されるので、
+            # queued_at=updated_at では古い updated_at が入り、待っているジョブより前に並んでしまう）
+            now = time.time()
+            if error is None and db.execute("UPDATE ingest_jobs SET status='queued',phase='確認の結果を当てる作り直しを再受付',"
+                                            "rerun=0,publication_started=0,result=?,owner=NULL,updated_at=?,queued_at=? "
+                                            "WHERE id=? AND owner=? AND status='running' "
+                                            "AND kind='review' AND rerun=1",
+                                            (json.dumps(result, ensure_ascii=False) if result is not None else None,
+                                             now, now, identity, owner)).rowcount:
+                return
+            failed = error is not None  # 空の文字列も失敗として扱う（メッセージのない例外など）
             db.execute("""UPDATE ingest_jobs SET status=?,phase=?,result=?,error=?,owner=NULL,updated_at=?
                 WHERE id=? AND owner=? AND status='running'""",
-                ("failed" if error else "completed", "失敗" if error else "完了",
+                ("failed" if failed else "completed", "失敗" if failed else "完了",
                  json.dumps(result, ensure_ascii=False) if result is not None else None,
                  error, time.time(), identity, owner))
 
@@ -205,7 +373,22 @@ class Jobs:
 
     def retry(self, wiki_root: str, job_id: str) -> dict:
         current = self.status(wiki_root, job_id)
+        if current.get("kind") == "review":
+            # 作り直しのジョブは、wiki と PDF ごとに 1 つだけ持つ。待っているか処理中のものがあれば、それを返す。
+            # 確かめることと待ちに戻すことを、1 つのトランザクションで行う（別の接続が、あいだに登録できないように）
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("""SELECT id FROM ingest_jobs WHERE kind='review' AND wiki=? AND doc_id=? AND id!=?
+                    AND status IN ('queued','running','paused') LIMIT 1""", (current["wiki"], current["doc_id"], job_id)).fetchone()
+                if row is None:
+                    now = time.time()  # queued_at は今の時刻（finish の再受付と同じ理由）
+                    db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,"
+                               "publication_started=0,updated_at=?,queued_at=? WHERE id=? AND status IN ('failed','cancelled')",
+                               (now, now, job_id))
+            return self.status(current["wiki"], row[0] if row else job_id)
         with self.connect() as db:
-            db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,updated_at=? WHERE id=? AND status IN ('failed','cancelled')",
-                       (time.time(), job_id))
+            # 前の試行の「公開を始めた」印を戻す（新しい試行は、まだ公開を始めていないので取り消せる）
+            now = time.time()  # queued_at は今の時刻（finish の再受付と同じ理由）
+            db.execute("UPDATE ingest_jobs SET status='queued',phase='再試行待ち',owner=NULL,error=NULL,publication_started=0,"
+                       "updated_at=?,queued_at=? WHERE id=? AND status IN ('failed','cancelled')", (now, now, job_id))
         return self.status(current["wiki"], job_id)
